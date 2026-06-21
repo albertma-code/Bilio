@@ -1,6 +1,6 @@
-# B站视频下载
+# Yabi
 
-一个面向 macOS 桌面的 B站视频下载工具。项目目标是把已经验证可用的 `yt-dlp` 下载能力，包装成更易用、更好看的桌面应用。
+一个面向 macOS 桌面的 B站视频下载工具。基于开源的 [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) 下载能力，包装成更易用、更好看的图形界面（GUI）应用。计划使用轻量桌面方案 Tauri 构建前端。
 
 ## 当前状态
 
@@ -54,4 +54,6 @@ python3 -m venv .venv
 
 ## 许可证
 
-许可证暂未选择。准备正式开源前，需要确认使用 MIT、Apache-2.0、GPL-3.0 或其他许可证。
+本项目基于 [MIT](LICENSE) 许可证开源。
+
+下载能力由 [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) 提供（其自身的许可证适用）。Yabi 仅为其提供图形界面封装。

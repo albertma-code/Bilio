@@ -1,5 +1,40 @@
 .venv/
 downloads/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 敏感数据 —— 切勿提交
+*.cookies
+*.cookies.txt
+cookies*.txt
+*cookie*.json
+*.session
+*.token
+.env
+.env.*
+
+# 媒体与下载产物
+*.mp4
+*.mkv
+*.flv
+*.webm
+*.m4a
+*.mp3
+*.srt
+*.vtt
+*.ass
+*.nfo
+*.jpg
+*.png
+!docs/**/*.png
+!docs/**/*.jpg
+
+# 日志与系统文件
 *.log
 .DS_Store
-
