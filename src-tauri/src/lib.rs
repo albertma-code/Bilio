@@ -1,0 +1,263 @@
+//! Yabi — Tauri shell that owns the Python sidecar process.
+//!
+//! Architecture: the Rust shell spawns a single long-lived Python sidecar
+//! (`binaries/yabi-sidecar-<target-triple>`, built via `sidecar/build.sh`) and
+//! brokers JSONL requests/responses between the Vue frontend and yt-dlp.
+//!
+//! - Request flow:  frontend `invoke("ping_sidecar")` → Rust assigns an id,
+//!   writes `{"id":N,"cmd":"ping"}\n` to the sidecar's stdin, awaits the
+//!   matching response on a `oneshot` channel resolved by the stdout reader.
+//! - Unsolicited messages (`id == null`, e.g. `ready` / future `log`) are
+//!   forwarded to the frontend as a Tauri event `sidecar://message`.
+//!
+//! Protocol details live in `sidecar/yabi_sidecar/rpc.py`.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
+use serde_json::Value;
+use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_shell::process::{CommandChild, CommandEvent};
+use tauri_plugin_shell::ShellExt;
+use tokio::sync::oneshot;
+
+/// State shared between the stdout reader task and `#[tauri::command]` handlers.
+///
+/// `child` is taken (`Option`) so a future `shutdown` command could move the
+/// handle out and `kill()` it. `pending` correlates outbound request ids with
+/// the oneshot sender that resolves the awaiting `invoke` call.
+struct SidecarState {
+    child: Mutex<Option<CommandChild>>,
+    pending: Mutex<HashMap<u64, oneshot::Sender<Value>>>,
+    next_id: AtomicU64,
+}
+
+impl SidecarState {
+    fn new() -> Self {
+        Self {
+            child: Mutex::new(None),
+            pending: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    fn alloc_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+/// Spawn the sidecar binary and start the stdout reader. Called once from
+/// `setup`. Panics on failure — we cannot run without the sidecar.
+fn spawn_sidecar(app: &AppHandle, state: &SidecarState) -> Result<(), String> {
+    let (mut rx, child) = app
+        .shell()
+        .sidecar("yabi-sidecar")
+        .map_err(|e| format!("sidecar not found: {e}"))?
+        .spawn()
+        .map_err(|e| format!("failed to spawn sidecar: {e}"))?;
+
+    *state.child.lock().unwrap() = Some(child);
+
+    // Reader task: each `CommandEvent::Stdout` already arrives line-by-line
+    // (Tauri's plugin-shell splits on '\n'), so each line is one JSON object.
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            match event {
+                CommandEvent::Stdout(bytes) => {
+                    let line = String::from_utf8_lossy(&bytes);
+                    handle_sidecar_line(&app_handle, line.trim());
+                }
+                CommandEvent::Stderr(bytes) => {
+                    // Sidecar logs go to stderr by design — surface them in the
+                    // Rust console for debugging, but never to the frontend.
+                    eprintln!(
+                        "[sidecar:stderr] {}",
+                        String::from_utf8_lossy(&bytes).trim_end()
+                    );
+                }
+                CommandEvent::Terminated(payload) => {
+                    eprintln!("[sidecar] terminated: {:?}", payload);
+                    // Drop all pending senders so awaiters get an error rather
+                    // than hanging forever.
+                    let state: State<SidecarState> = app_handle.state();
+                    state.pending.lock().unwrap().clear();
+                    break;
+                }
+                CommandEvent::Error(e) => {
+                    eprintln!("[sidecar] error: {e}");
+                }
+                _ => {}
+            }
+        }
+    });
+
+    Ok(())
+}
+
+/// Parse one JSONL line from the sidecar and either resolve a pending request
+/// (when `id` is a number we issued AND no later messages for that id are
+/// expected) or emit it to the frontend as an event.
+///
+/// Note: long-running commands (`download`) emit MULTIPLE messages for the
+/// same id — first a `result` with `status: "started"` (consumed by the
+/// awaiting invoke), then a stream of `progress`/terminal `result`/`error`.
+/// We resolve the pending oneshot on the FIRST matching response; the rest
+/// arrive after pending is gone and fall through to the event channel below.
+fn handle_sidecar_line(app: &AppHandle, line: &str) {
+    if line.is_empty() {
+        return;
+    }
+    let msg: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[sidecar] non-JSON on stdout (protocol violation): {e}: {line:?}");
+            return;
+        }
+    };
+
+    if let Some(id) = msg.get("id").and_then(Value::as_u64) {
+        let state: State<SidecarState> = app.state();
+        let maybe_tx = state.pending.lock().unwrap().remove(&id);
+        if let Some(tx) = maybe_tx {
+            let _ = tx.send(msg);
+            return;
+        }
+        // No pending sender — this is a streaming follow-up (download
+        // progress / terminal status). Fall through to emit to the frontend.
+    }
+
+    // Forward as a frontend event. UI listeners filter by `type` and `id`.
+    let _ = app.emit("sidecar://message", line.to_string());
+}
+
+/// Send a request to the sidecar and await its terminal response.
+///
+/// Returns the full JSON message (so callers can read either `data` or
+/// `error`); shape it at the call site.
+async fn request(state: &SidecarState, cmd: &str, args: Value) -> Result<Value, String> {
+    let id = state.alloc_id();
+    let (tx, rx) = oneshot::channel();
+    state.pending.lock().unwrap().insert(id, tx);
+
+    let payload = serde_json::json!({ "id": id, "cmd": cmd, "args": args });
+    let line = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+
+    {
+        let mut guard = state.child.lock().unwrap();
+        let child = guard
+            .as_mut()
+            .ok_or_else(|| "sidecar not running".to_string())?;
+        child
+            .write(format!("{line}\n").as_bytes())
+            .map_err(|e| format!("failed to write to sidecar stdin: {e}"))?;
+    }
+
+    let resp = rx
+        .await
+        .map_err(|_| "sidecar dropped response (terminated?)".to_string())?;
+
+    // Sidecar reports errors in-band as `{"type":"error","error":"..."}`.
+    if resp.get("type").and_then(Value::as_str) == Some("error") {
+        let err = resp
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown sidecar error");
+        return Err(err.to_string());
+    }
+    Ok(resp)
+}
+
+#[tauri::command]
+async fn ping_sidecar(state: State<'_, SidecarState>) -> Result<Value, String> {
+    // Forward the whole response object; the UI shows `ts` to confirm round-trip.
+    request(&state, "ping", Value::Null).await
+}
+
+#[tauri::command]
+async fn parse_url(url: String, state: State<'_, SidecarState>) -> Result<Value, String> {
+    let resp = request(&state, "parse", serde_json::json!({ "url": url })).await?;
+    // For commands that return data, hand the frontend just the `data` slice.
+    Ok(resp.get("data").cloned().unwrap_or(resp))
+}
+
+/// Start a download. Returns the `job_id` (== request id) the frontend uses
+/// to filter progress/completion events on the `sidecar://message` channel,
+/// and to cancel the job later.
+///
+/// The sidecar acknowledges immediately with `{status: "started"}`; the
+/// actual download runs on a worker thread and streams `progress` events
+/// (same id), terminating in a second `result` with `status: "completed"|
+/// "cancelled"` or an `error`. We listen for the first response here and
+/// surface the id to the frontend.
+#[tauri::command]
+async fn download_video(
+    url: String,
+    format_id: String,
+    output_dir: String,
+    state: State<'_, SidecarState>,
+) -> Result<u64, String> {
+    let id = state.alloc_id();
+    let (tx, rx) = oneshot::channel();
+    state.pending.lock().unwrap().insert(id, tx);
+
+    let payload = serde_json::json!({
+        "id": id,
+        "cmd": "download",
+        "args": { "url": url, "format_id": format_id, "output_dir": output_dir }
+    });
+    let line = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+
+    {
+        let mut guard = state.child.lock().unwrap();
+        let child = guard
+            .as_mut()
+            .ok_or_else(|| "sidecar not running".to_string())?;
+        child
+            .write(format!("{line}\n").as_bytes())
+            .map_err(|e| format!("failed to write to sidecar stdin: {e}"))?;
+    }
+
+    let ack = rx
+        .await
+        .map_err(|_| "sidecar dropped response (terminated?)".to_string())?;
+
+    if ack.get("type").and_then(Value::as_str) == Some("error") {
+        let err = ack
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown sidecar error");
+        return Err(err.to_string());
+    }
+
+    // Subsequent progress + terminal messages will arrive on the
+    // `sidecar://message` event stream with the same id.
+    Ok(id)
+}
+
+#[tauri::command]
+async fn cancel_download(job_id: u64, state: State<'_, SidecarState>) -> Result<Value, String> {
+    request(&state, "cancel", serde_json::json!({ "job_id": job_id })).await
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_shell::init())
+        .manage(SidecarState::new())
+        .setup(|app| {
+            let state: State<SidecarState> = app.state();
+            spawn_sidecar(&app.handle(), &state).expect("failed to start sidecar");
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            ping_sidecar,
+            parse_url,
+            download_video,
+            cancel_download
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
