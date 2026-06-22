@@ -134,7 +134,7 @@ function saveCookiesBrowser(val: string | null) {
                 size="small"
               />
             </n-descriptions-item>
-            <n-descriptions-item label="使用浏览器 Cookies（解锁会员清晰度）">
+            <n-descriptions-item label="使用浏览器 Cookies（账号可访问清晰度）">
               <n-select
                 :value="cookiesBrowser ?? ''"
                 :options="browserOptions"
@@ -184,7 +184,8 @@ function saveCookiesBrowser(val: string | null) {
           </n-descriptions>
           <p class="settings-note">
             选择浏览器后，Yabi 会读取该浏览器中已登录 B站的 cookies，从而解析/下载
-            会员清晰度或仅登录可见的视频。Cookies 仅在本机使用，不上传任何位置。
+            账号有权限访问的清晰度或仅登录可见的视频。Cookies 仅在本机使用，不上传任何位置。
+            Yabi 不支持破解、DRM 解密或绕过付费验证。
           </p>
         </n-drawer-content>
       </n-drawer>

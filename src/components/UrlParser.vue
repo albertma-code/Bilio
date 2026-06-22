@@ -409,7 +409,7 @@ const entryColumns = computed<DataTableColumns<ParsedEntry>>(() => [
               {{
                 props.cookiesBrowser
                   ? `已使用 ${props.cookiesBrowser} Cookies 解析每集可用画质；批量下载会按所选清晰度重新确认。`
-                  : '当前未使用浏览器 Cookies，会员清晰度可能不可用。'
+                  : '当前未使用浏览器 Cookies，账号限定清晰度可能不可用。'
               }}
             </p>
           </n-descriptions-item>

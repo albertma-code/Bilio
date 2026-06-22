@@ -20,8 +20,8 @@ from yt_dlp import YoutubeDL
 # plus `Referer` AND `Origin` headers pointing back to bilibili.com is what
 # bilibili's WAF requires for anonymous metadata fetches; without Origin the
 # extractor still 412s on the JSON metadata endpoint (verified against current
-# yt-dlp extractor). Cookie-gated content (member-only, 大会员 quality) still
-# needs the user's own cookies — a future settings feature.
+# yt-dlp extractor). Cookie-gated content still needs the user's own local
+# browser cookies; Yabi reuses that login state without storing cookie contents.
 _DEFAULT_HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -88,7 +88,7 @@ def check_cookies(cookies_from_browser: Optional[str]) -> dict[str, Any]:
     - whether the session is recognized (`isLogin`)
     - the display name (`uname`) — surfaces "已登录 albert"
     - VIP status (`vipStatus == 1`) and VIP label (`vip_label.text` or
-      `vipType` fallback) — so the UI can hint at 大会员 quality unlocking
+      `vipType` fallback) — so the UI can explain which account state is used
 
     Returns a stable shape; any failure populates `error` and leaves
     `logged_in` False so the UI can render "读取失败 …" rather than crash.

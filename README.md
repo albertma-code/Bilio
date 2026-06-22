@@ -24,7 +24,7 @@ Yabi.app/Contents/MacOS/
 - 取消下载
 - 完成后"在 Finder 中显示"
 - **合集 / 番剧批量下载**：解析合集后多选分集 + 选清晰度（best / ≤1080p / ≤720p / ≤480p / ≤360p）→ 顺序排队下载
-- **浏览器 Cookies 导入**：在设置里选 Safari / Chrome / Firefox / Edge / Brave / Chromium，让 yt-dlp 复用浏览器登录态，解锁会员清晰度（1080P 高码率、1080P 高清等需大会员的清晰度）
+- **浏览器 Cookies 导入**：在设置里选 Safari / Chrome / Firefox / Edge / Brave / Chromium，让 yt-dlp 复用本机浏览器登录态，获取账号有权限访问的清晰度
 - 下载目录设置（localStorage 持久化）
 - ffmpeg 自动捆绑（imageio-ffmpeg）—— 用户无需自己装
 
@@ -70,6 +70,8 @@ npm run tauri build
 - 含个人信息的日志
 
 仓库已默认忽略 `downloads/`、`.venv/`、`node_modules/`、`src-tauri/target/`、`src-tauri/binaries/*-*`、各种 cookies/cookie 文件名等。
+
+Yabi 仅用于保存用户本人有权访问的内容，不支持破解、DRM 解密或绕过付费验证。
 
 ## 许可证
 
