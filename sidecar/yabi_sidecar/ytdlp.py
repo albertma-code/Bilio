@@ -89,7 +89,10 @@ def parse_url(url: str, cookies_from_browser: Optional[str] = None) -> dict[str,
     _apply_cookies(opts, cookies_from_browser)
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
-    return _shape(info or {})
+    shaped = _shape(info or {})
+    if shaped.get("is_playlist") and shaped.get("entries"):
+        _enrich_entries(shaped["entries"], cookies_from_browser)
+    return shaped
 
 
 def download_video(
@@ -110,6 +113,7 @@ def download_video(
     `CancelRequested` which bubbles up through yt-dlp.
     """
     os.makedirs(output_dir, exist_ok=True)
+    resolved_format = _format_with_audio(format_id)
 
     def _hook(d: dict[str, Any]) -> None:
         if cancel_event.is_set():
@@ -117,12 +121,11 @@ def download_video(
         progress_callback(d)
 
     opts: dict[str, Any] = {
-        "format": format_id,
-        # When a format_id refers to a video-only or audio-only stream,
-        # yt-dlp will fetch+merge the matching counterpart. The format
-        # string `<id>+bestaudio/best` is the simplest way to express that.
-        # We pass it verbatim; if the user picks a combined format, the +
-        # suffix is harmless.
+        # Bilibili exposes video and audio as separate DASH streams. A table
+        # row like "30080" is video-only, so exact ids must be expanded to
+        # "<id>+bestaudio/best"; richer expressions from batch downloads are
+        # already complete and should be left untouched.
+        "format": resolved_format,
         "outtmpl": os.path.join(output_dir, "%(title)s [%(id)s].%(ext)s"),
         "quiet": True,
         "no_warnings": True,
@@ -149,6 +152,22 @@ def download_video(
     return None
 
 
+def _format_with_audio(format_id: str) -> str:
+    """Return a yt-dlp format expression that keeps audio with exact video ids.
+
+    The UI's single-video table emits raw Bilibili format ids such as "30080".
+    Passing that directly to yt-dlp downloads video-only content. Batch mode
+    emits full selectors such as "bv*[height<=1080]+ba/best", so expressions
+    containing yt-dlp operators are preserved as-is.
+    """
+    fmt = format_id.strip()
+    if not fmt:
+        return fmt
+    if any(op in fmt for op in ("+", "/", ",")):
+        return fmt
+    return f"{fmt}+bestaudio/best"
+
+
 def _entry_title(e: dict[str, Any], idx: int) -> Optional[str]:
     """Best-effort title for a flat-extracted entry.
 
@@ -165,20 +184,159 @@ def _entry_title(e: dict[str, Any], idx: int) -> Optional[str]:
     return f"第 {idx + 1} 集"
 
 
+def _entry_display_title(detail: dict[str, Any], fallback: Optional[str]) -> Optional[str]:
+    """Return a useful episode title without exposing yt-dlp's bare numbers."""
+    episode_number = detail.get("episode_number")
+    if episode_number is not None:
+        return f"第 {episode_number} 集"
+    episode = detail.get("episode")
+    if episode:
+        return episode
+    title = detail.get("title")
+    if title and not str(title).isdigit():
+        return title
+    return fallback
+
+
+def _best_video_format(formats: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    videos = [
+        f for f in formats
+        if f.get("vcodec") and f.get("vcodec") != "none"
+    ]
+    if not videos:
+        return None
+
+    def sort_key(f: dict[str, Any]) -> tuple[int, int, int, float]:
+        return (
+            int(f.get("quality") or 0),
+            int(f.get("height") or 0),
+            int(f.get("width") or 0),
+            float(f.get("vbr") or 0),
+        )
+
+    return max(videos, key=sort_key)
+
+
+def _format_label(f: dict[str, Any]) -> Optional[str]:
+    return f.get("format") or f.get("format_note") or (
+        f"{f.get('height')}p" if f.get("height") else None
+    )
+
+
+def _enrich_entries(
+    entries: list[dict[str, Any]],
+    cookies_from_browser: Optional[str],
+) -> None:
+    """Resolve playlist entries once so the UI can show duration and quality.
+
+    Flat playlist extraction is fast but only returns episode URLs. For
+    bangumi/season downloads, users need to know what their current cookies can
+    actually access, so we pay the extra metadata requests here and keep the
+    downloaded media untouched (`skip_download=True`).
+    """
+    opts: dict[str, Any] = {
+        "skip_download": True,
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "http_headers": _DEFAULT_HTTP_HEADERS,
+    }
+    _apply_cookies(opts, cookies_from_browser)
+
+    with YoutubeDL(opts) as ydl:
+        for entry in entries:
+            entry["detail_status"] = "pending"
+            detail_url = entry.get("url")
+            if not detail_url:
+                entry["detail_status"] = "missing_url"
+                continue
+            try:
+                detail = ydl.extract_info(detail_url, download=False) or {}
+            except Exception as exc:
+                entry["detail_status"] = "error"
+                entry["detail_error"] = str(exc)
+                continue
+
+            entry["detail_status"] = "ok"
+            entry["title"] = _entry_display_title(detail, entry.get("title"))
+            entry["duration"] = detail.get("duration") or entry.get("duration")
+
+            best = _best_video_format(detail.get("formats") or [])
+            if not best:
+                entry["detail_status"] = "no_formats"
+                continue
+            entry["best_format_id"] = best.get("format_id")
+            entry["best_format_note"] = _format_label(best)
+            entry["best_width"] = best.get("width")
+            entry["best_height"] = best.get("height")
+            entry["best_quality"] = best.get("quality")
+
+
 def _shape(info: dict[str, Any]) -> dict[str, Any]:
     """Trim a yt-dlp info dict to a UI-friendly subset.
 
     The raw dict is huge (tens of KB of internal fields); we forward only what
     the parser screen actually renders. Add fields here as the UI grows.
+
+    Three content kinds get distinct treatment:
+    - `"bangumi"`: a single episode of a 番剧 (anime / drama). yt-dlp's
+      Bilibili-bangumi extractor returns `title` as bare episode number (e.g.
+      `"1"`), drops `uploader`, and never includes the actual series name (you
+      need the bilibili pgc API for that). We surface `episode_number` /
+      `episode_id` / `season_id` so the UI can show "番剧 · 第 N 集" instead
+      of the misleading bare title.
+    - `"playlist"`: an anthology / collection / multi-part video. Has
+      `entries`; the UI shows the part list.
+    - `"single"`: a regular standalone video. Has `uploader` and a real title.
     """
     raw_entries = info.get("entries") or []
+    extractor = (info.get("extractor") or info.get("extractor_key") or "").lower()
+    is_bangumi = "bangumi" in extractor
+    is_playlist = info.get("_type") == "playlist"
+
+    if is_bangumi:
+        kind = "bangumi"
+    elif is_playlist:
+        kind = "playlist"
+    else:
+        kind = "single"
+
+    raw_title = info.get("title")
+    episode_number = info.get("episode_number")
+    if kind == "bangumi":
+        # The raw `title` is just the episode number for bangumi (yt-dlp limitation);
+        # render something a human can read.
+        if episode_number is not None:
+            display_title = f"番剧 · 第 {episode_number} 集"
+        else:
+            display_title = f"番剧 · {raw_title}" if raw_title else "番剧"
+    else:
+        display_title = raw_title
+
+    # yt-dlp's bilibili-bangumi extractor reports an unreliable `duration` —
+    # the value is the entire-season cumulative time (or some other inflated
+    # number), not the single-episode duration. Showing it would mislead
+    # users into thinking they're getting an hour-long episode when they're
+    # actually getting ~24 min. Surface as None so the UI shows "—".
+    raw_duration = info.get("duration")
+    safe_duration = None if kind == "bangumi" else raw_duration
+
     return {
-        "title": info.get("title"),
+        "title": raw_title,
+        "display_title": display_title,
+        "kind": kind,
         "uploader": info.get("uploader"),
-        "duration": info.get("duration"),
+        "duration": safe_duration,
         "thumbnail": info.get("thumbnail"),
         "webpage_url": info.get("webpage_url"),
-        "is_playlist": info.get("_type") == "playlist",
+        "is_playlist": is_playlist,
+        # Bangumi-specific fields. Always present (None when not bangumi) so the
+        # frontend type stays stable.
+        "episode": info.get("episode"),
+        "episode_number": episode_number,
+        "episode_id": info.get("episode_id"),
+        "season_id": info.get("season_id"),
+        "extractor": info.get("extractor"),
         "entries": [
             {
                 "id": e.get("id") or (e.get("url") or "").split("?p=", 1)[-1] or f"_idx_{idx}",
@@ -193,10 +351,17 @@ def _shape(info: dict[str, Any]) -> dict[str, Any]:
                 "format_id": f.get("format_id"),
                 "ext": f.get("ext"),
                 "height": f.get("height"),
+                "width": f.get("width"),
                 "vbr": f.get("vbr"),
                 "acodec": f.get("acodec"),
                 "vcodec": f.get("vcodec"),
-                "format_note": f.get("format_note"),
+                # The bilibili extractor puts the human-readable Chinese
+                # quality label (e.g. "1080P 高清", "4K 超高清") in `format`,
+                # not `format_note`. Surface `format` first so the UI can
+                # tell apart "1080P 高清" vs "1080P 高码率" (same height
+                # 816, different bitrate) and label 1632p as 4K.
+                "format_note": f.get("format") or f.get("format_note"),
+                "quality": f.get("quality"),
                 "filesize": f.get("filesize") or f.get("filesize_approx"),
             }
             for f in (info.get("formats") or [])

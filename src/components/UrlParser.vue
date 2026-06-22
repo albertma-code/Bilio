@@ -42,9 +42,9 @@ const selectedEntryIds = ref<Array<string | null>>([]);
  * the per-entry format ids are unknown until each one is resolved, so we
  * use a generic "best video ≤ N height + best audio" expression.
  */
-const batchQuality = ref<string>("bv*[height<=1080]+ba/best");
+const batchQuality = ref<string>("bv*+ba/best");
 const batchQualityOptions = [
-  { label: "最高清晰度", value: "bv*+ba/best" },
+  { label: "最高可用清晰度", value: "bv*+ba/best" },
   { label: "≤ 1080p", value: "bv*[height<=1080]+ba/best" },
   { label: "≤ 720p", value: "bv*[height<=720]+ba/best" },
   { label: "≤ 480p", value: "bv*[height<=480]+ba/best" },
@@ -87,11 +87,10 @@ async function onParse() {
 
 function doDownload(row: ParsedFormat) {
   if (!url.value.trim()) return;
-  const label = row.height
-    ? `${row.height}p · ${row.format_id}`
-    : row.format_note
-      ? `${row.format_note} · ${row.format_id}`
-      : row.format_id ?? "unknown";
+  // Prefer the human-readable format name (e.g. "4K 超高清") because the
+  // bilibili extractor gives us the nice Chinese labels there.
+  const prefix = row.format_note || (row.height ? `${row.height}p` : "音频");
+  const label = `${prefix} · ${row.format_id}`;
   emit("download", url.value.trim(), row.format_id ?? "", label);
 }
 
@@ -115,6 +114,13 @@ const allSelected = computed(
   () => !!info.value && selectedEntryIds.value.length === info.value.entries.length && info.value.entries.length > 0,
 );
 
+function entryBestQualityLabel(row: ParsedEntry): string {
+  if (row.best_format_note) return row.best_format_note;
+  if (row.detail_status === "error") return "解析失败";
+  if (row.detail_status === "no_formats") return "无可用画质";
+  return "—";
+}
+
 function doBatchDownload() {
   if (!info.value) return;
   const selected = info.value.entries.filter(
@@ -135,28 +141,40 @@ function doBatchDownload() {
 }
 
 const formatColumns: DataTableColumns<ParsedFormat> = [
-  { title: "ID", key: "format_id", width: 100 },
+  { title: "ID", key: "format_id", width: 80 },
   {
-    title: "说明",
+    title: "清晰度",
+    key: "format_note",
+    minWidth: 130,
+    // The Bilibili extractor labels each stream as e.g. "1080P 高清",
+    // "1080P 高码率", "4K 超高清". Those names are far more useful than the
+    // raw pixel height (especially since cinematic 21:9 episodes are 1632p,
+    // not 2160p — but they ARE 4K). Fall back to a "<height>p" label only
+    // when no proper note exists; pure audio rows have neither.
+    render: (row) =>
+      row.format_note ?? (row.height ? `${row.height}p` : "音频"),
+  },
+  {
+    title: "尺寸",
     key: "height",
     width: 100,
     render: (row) =>
-      row.height
-        ? `${row.height}p`
-        : row.format_note ?? "音频",
+      row.width && row.height ? `${row.width}×${row.height}` : "—",
   },
   { title: "容器", key: "ext", width: 70 },
   {
     title: "大小",
     key: "filesize",
     width: 100,
-    render: (row) =>
-      row.filesize != null
-        ? `${(row.filesize / 1024 / 1024).toFixed(1)} MB`
-        : "—",
+    render: (row) => {
+      if (row.filesize == null) return "—";
+      const mb = row.filesize / 1024 / 1024;
+      return mb >= 1024
+        ? `${(mb / 1024).toFixed(2)} GB`
+        : `${mb.toFixed(0)} MB`;
+    },
   },
   { title: "视频编码", key: "vcodec", width: 110 },
-  { title: "音频编码", key: "acodec", width: 110 },
   {
     title: "",
     key: "_action",
@@ -190,6 +208,19 @@ const entryColumns = computed<DataTableColumns<ParsedEntry>>(() => [
     key: "duration",
     width: 100,
     render: (row) => formatDuration(row.duration),
+  },
+  {
+    title: "最高画质",
+    key: "best_format_note",
+    width: 150,
+    render: entryBestQualityLabel,
+  },
+  {
+    title: "尺寸",
+    key: "best_height",
+    width: 110,
+    render: (row) =>
+      row.best_width && row.best_height ? `${row.best_width}×${row.best_height}` : "—",
   },
 ]);
 </script>
@@ -225,16 +256,32 @@ const entryColumns = computed<DataTableColumns<ParsedEntry>>(() => [
             preview-disabled
           />
           <div class="meta">
-            <h3>{{ info.title || "(无标题)" }}</h3>
-            <p class="uploader">
+            <h3>{{ info.display_title || info.title || "(无标题)" }}</h3>
+            <p v-if="info.kind !== 'bangumi'" class="uploader">
               UP 主：<strong>{{ info.uploader || "—" }}</strong>
             </p>
+            <p v-else class="uploader">
+              来源：<strong>B站番剧</strong>
+              <span v-if="info.season_id"> · 季 {{ info.season_id }}</span>
+              <span v-if="info.episode_id"> · 集 {{ info.episode_id }}</span>
+            </p>
             <p class="badges">
-              <n-tag :type="info.is_playlist ? 'info' : 'default'" size="small">
-                {{ info.is_playlist ? "合集 / 列表" : "单个视频" }}
+              <n-tag
+                :type="info.kind === 'bangumi' ? 'warning' : (info.is_playlist ? 'info' : 'default')"
+                size="small"
+              >
+                {{
+                  info.kind === 'bangumi'
+                    ? '番剧'
+                    : info.is_playlist
+                      ? '合集 / 列表'
+                      : '单个视频'
+                }}
               </n-tag>
-              <n-tag size="small">时长 {{ formatDuration(info.duration) }}</n-tag>
-              <n-tag size="small">{{ info.formats.length }} 种格式</n-tag>
+              <n-tag v-if="info.duration != null" size="small">
+                时长 {{ formatDuration(info.duration) }}
+              </n-tag>
+              <n-tag v-if="info.formats.length" size="small">{{ info.formats.length }} 种格式</n-tag>
               <n-tag v-if="info.is_playlist" size="small">
                 {{ info.entries.length }} 个分集
               </n-tag>
@@ -278,6 +325,13 @@ const entryColumns = computed<DataTableColumns<ParsedEntry>>(() => [
                 批量下载 ({{ selectedEntryIds.length }})
               </n-button>
             </n-space>
+            <p class="batch-hint">
+              {{
+                props.cookiesBrowser
+                  ? `已使用 ${props.cookiesBrowser} Cookies 解析每集可用画质；批量下载会按所选清晰度重新确认。`
+                  : '当前未使用浏览器 Cookies，会员清晰度可能不可用。'
+              }}
+            </p>
           </n-descriptions-item>
         </n-descriptions>
 
@@ -363,5 +417,10 @@ const entryColumns = computed<DataTableColumns<ParsedEntry>>(() => [
 .batch-label {
   font-size: 0.85rem;
   color: var(--n-text-color-2, #666);
+}
+.batch-hint {
+  margin: 0.5rem 0 0;
+  font-size: 0.8rem;
+  color: var(--n-text-color-3, #888);
 }
 </style>

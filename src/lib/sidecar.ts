@@ -27,10 +27,18 @@ export interface ParsedFormat {
   format_id: string | null;
   ext: string | null;
   height: number | null;
+  /** Width in pixels — paired with `height` for the "尺寸" column. */
+  width: number | null;
   vbr: number | null;
   acodec: string | null;
   vcodec: string | null;
+  /** Human-readable quality label from yt-dlp's bilibili extractor —
+   *  e.g. "1080P 高清", "1080P 高码率", "4K 超高清". The sidecar prefers
+   *  the `format` field (which carries this) over `format_note` (None on
+   *  Bilibili). Falls back to `format_note` for non-Bilibili sources. */
   format_note: string | null;
+  /** B站 qn quality number (80 = 1080P, 112 = 1080P高码, 120 = 4K). */
+  quality: number | null;
   filesize: number | null;
 }
 
@@ -39,15 +47,37 @@ export interface ParsedEntry {
   title: string | null;
   duration: number | null;
   url: string | null;
+  detail_status: "pending" | "ok" | "missing_url" | "error" | string | null;
+  detail_error: string | null;
+  best_format_id: string | null;
+  best_format_note: string | null;
+  best_width: number | null;
+  best_height: number | null;
+  best_quality: number | null;
 }
 
 export interface ParsedVideo {
   title: string | null;
+  /** Human-friendly title used for display; falls back to `title`.
+   *  For 番剧 (bangumi), yt-dlp's raw `title` is a bare episode number,
+   *  so the sidecar synthesizes "番剧 · 第 N 集" here instead. */
+  display_title: string | null;
+  /** Content classification from the sidecar:
+   *  - `"single"`: standalone video (UP 主投稿)
+   *  - `"playlist"`: anthology / collection / multi-part
+   *  - `"bangumi"`: a single episode of an anime / drama (no UP 主) */
+  kind: "single" | "playlist" | "bangumi" | string;
   uploader: string | null;
   duration: number | null;
   thumbnail: string | null;
   webpage_url: string | null;
   is_playlist: boolean;
+  /** Bangumi-only — null for other kinds. */
+  episode: string | null;
+  episode_number: number | null;
+  episode_id: string | null;
+  season_id: string | null;
+  extractor: string | null;
   entries: ParsedEntry[];
   formats: ParsedFormat[];
 }
