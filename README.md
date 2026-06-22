@@ -21,6 +21,8 @@ Yabi.app/Contents/MacOS/
 - 一键下载，实时进度条 + 速度 + 剩余时间
 - 取消下载
 - 完成后"在 Finder 中显示"
+- **合集 / 番剧批量下载**：解析合集后多选分集 + 选清晰度（best / ≤1080p / ≤720p / ≤480p / ≤360p）→ 顺序排队下载
+- **浏览器 Cookies 导入**：在设置里选 Safari / Chrome / Firefox / Edge / Brave / Chromium，让 yt-dlp 复用浏览器登录态，解锁会员清晰度（1080P 高码率、1080P 高清等需大会员的清晰度）
 - 下载目录设置（localStorage 持久化）
 - ffmpeg 自动捆绑（imageio-ffmpeg）—— 用户无需自己装
 
@@ -46,6 +48,14 @@ npm run tauri dev
 npm run tauri build
 # 产物：src-tauri/target/release/bundle/{macos/Yabi.app, dmg/Yabi_*.dmg}
 ```
+
+## 安装
+
+发布版本（macOS arm64，Apple Silicon）：
+
+1. 从 [Releases](https://github.com/albertma-code/Yabi/releases) 下载 `Yabi_<version>_aarch64.dmg`
+2. 打开 DMG，把 `Yabi.app` 拖到"应用程序"
+3. 首次启动如果 macOS 提示「无法验证开发者」：右键 → 打开 → 仍然打开（Yabi 使用本机 ad-hoc 签名，未注册 Apple Developer 程序）
 
 ## 安全与隐私
 
