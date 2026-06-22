@@ -21,6 +21,7 @@ import {
 import {
   formatDuration,
   parseUrl,
+  type ParseProgressEvent,
   type ParsedEntry,
   type ParsedFormat,
   type ParsedVideo,
@@ -33,6 +34,10 @@ const loading = ref(false);
 const error = ref<string | null>(null);
 const info = ref<ParsedVideo | null>(null);
 const message = useMessage();
+
+/** Per-entry enrichment progress. Set to `{done, total}` while parse is
+ *  running so the UI can render "已解析 N / M"; null when idle. */
+const parseProgress = ref<{ done: number; total: number } | null>(null);
 
 /** Selected entry ids when info is a playlist. Used by batch download. */
 const selectedEntryIds = ref<Array<string | null>>([]);
@@ -69,19 +74,91 @@ async function onParse() {
   error.value = null;
   info.value = null;
   selectedEntryIds.value = [];
+  parseProgress.value = null;
+
+  // Preview the skeleton immediately so the user sees the entry list and
+  // format table without waiting for per-entry enrichment. We create a
+  // placeholder info, then merge progress events as they arrive.
+  const initialInfo: ParsedVideo = {
+    title: null,
+    display_title: "解析中…",
+    kind: "playlist",
+    uploader: null,
+    duration: null,
+    thumbnail: null,
+    webpage_url: url.value.trim(),
+    is_playlist: false,
+    episode: null,
+    episode_number: null,
+    episode_id: null,
+    season_id: null,
+    extractor: null,
+    entries: [],
+    formats: [],
+  };
+  info.value = initialInfo;
+
+  function onProgress(e: ParseProgressEvent) {
+    parseProgress.value = { done: e.index + 1, total: e.total };
+    if (!info.value) return;
+    // First progress event tells us this is in fact a playlist with N entries;
+    // promote the skeleton so the playlist UI renders while remaining entries
+    // are still resolving.
+    if (!info.value.is_playlist && e.total > 0) {
+      info.value.is_playlist = true;
+    }
+    // Ensure the entries array is large enough (entries may arrive in order
+    // but the skeleton hasn't populated them yet — we index into it).
+    const entries = info.value.entries;
+    while (entries.length < e.total) {
+      entries.push({
+        id: `_pending_${entries.length}`,
+        title: `第 ${entries.length + 1} 集`,
+        duration: null,
+        url: null,
+        detail_status: "pending",
+        detail_error: null,
+        best_format_id: null,
+        best_format_note: null,
+        best_width: null,
+        best_height: null,
+        best_quality: null,
+      });
+    }
+    // Merge enriched fields from the sidecar into the skeleton slot.
+    const target = entries[e.index];
+    if (e.entry.id != null) target.id = e.entry.id;
+    if (e.entry.title != null) target.title = e.entry.title;
+    if (e.entry.duration != null) target.duration = e.entry.duration;
+    if (e.entry.detail_status != null) target.detail_status = e.entry.detail_status;
+    if (e.entry.best_format_note != null) target.best_format_note = e.entry.best_format_note;
+    if (e.entry.best_width != null) target.best_width = e.entry.best_width;
+    if (e.entry.best_height != null) target.best_height = e.entry.best_height;
+    target.detail_error = e.entry.detail_error ?? null;
+    // Force reactivity by reassigning the ref.
+    info.value = { ...info.value, entries: [...entries] };
+  }
+
   try {
-    info.value = await parseUrl(url.value.trim(), props.cookiesBrowser);
-    if (info.value?.is_playlist) {
-      // Default-select all entries — typical use case is "download whole collection".
-      selectedEntryIds.value = info.value.entries
+    const result = await parseUrl(url.value.trim(), props.cookiesBrowser, onProgress);
+    info.value = result;
+    // Set is_playlist — the skeleton had it false, the real result has the truth.
+    info.value.is_playlist = result.is_playlist;
+    parseProgress.value = null;
+
+    if (result.is_playlist) {
+      // Default-select all entries.
+      selectedEntryIds.value = result.entries
         .map((e) => e.id)
         .filter((id): id is string => id != null);
     }
     message.success("解析成功");
   } catch (e: any) {
     error.value = typeof e === "string" ? e : e?.message ?? "未知错误";
+    info.value = null;
   } finally {
     loading.value = false;
+    parseProgress.value = null;
   }
 }
 
@@ -309,6 +386,9 @@ const entryColumns = computed<DataTableColumns<ParsedEntry>>(() => [
               size="small"
             />
             <n-space style="margin-top: 0.75rem" align="center">
+              <n-tag v-if="parseProgress" type="info" size="small">
+                已解析 {{ parseProgress.done }} / {{ parseProgress.total }}
+              </n-tag>
               <span class="batch-label">清晰度</span>
               <n-select
                 v-model:value="batchQuality"

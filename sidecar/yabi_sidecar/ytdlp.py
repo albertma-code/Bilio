@@ -7,8 +7,11 @@ corrupt the JSONL protocol the Rust shell reads.
 """
 from __future__ import annotations
 
+import json
 import os
 import threading
+import urllib.error
+import urllib.request
 from typing import Any, Callable, Optional
 
 from yt_dlp import YoutubeDL
@@ -75,7 +78,114 @@ def _apply_cookies(opts: dict[str, Any], cookies_from_browser: Optional[str]) ->
     opts["cookiesfrombrowser"] = (cookies_from_browser,)
 
 
-def parse_url(url: str, cookies_from_browser: Optional[str] = None) -> dict[str, Any]:
+def check_cookies(cookies_from_browser: Optional[str]) -> dict[str, Any]:
+    """Probe the user's Bilibili login state using the given browser's cookies.
+
+    Strategy: ask yt-dlp's cookie extractor for a `CookieJar` (so we reuse the
+    same browser-keyring code path the downloader will), build a header
+    `Cookie: ...` from just the `bilibili.com`-scoped cookies, and call the
+    public `web-interface/nav` endpoint. The response tells us:
+    - whether the session is recognized (`isLogin`)
+    - the display name (`uname`) — surfaces "已登录 albert"
+    - VIP status (`vipStatus == 1`) and VIP label (`vip_label.text` or
+      `vipType` fallback) — so the UI can hint at 大会员 quality unlocking
+
+    Returns a stable shape; any failure populates `error` and leaves
+    `logged_in` False so the UI can render "读取失败 …" rather than crash.
+    """
+    result: dict[str, Any] = {
+        "ok": False,
+        "logged_in": False,
+        "username": None,
+        "is_vip": False,
+        "vip_label": None,
+        "error": None,
+    }
+    if not cookies_from_browser:
+        result["error"] = "未选择浏览器"
+        return result
+    if cookies_from_browser not in {
+        "chrome", "chromium", "brave", "edge", "firefox",
+        "opera", "safari", "vivaldi", "whale",
+    }:
+        result["error"] = f"不支持的浏览器: {cookies_from_browser}"
+        return result
+
+    # Extract cookies via yt-dlp so we share its keyring/profile handling.
+    try:
+        from yt_dlp.cookies import extract_cookies_from_browser
+
+        jar = extract_cookies_from_browser(cookies_from_browser)
+    except Exception as exc:
+        result["error"] = f"读取浏览器 Cookies 失败: {exc}"
+        return result
+
+    bili_cookies = [c for c in jar if "bilibili.com" in (c.domain or "")]
+    if not bili_cookies:
+        result["error"] = "未在该浏览器中找到 bilibili.com 的 Cookies"
+        return result
+    cookie_header = "; ".join(f"{c.name}={c.value}" for c in bili_cookies)
+
+    req = urllib.request.Request(
+        "https://api.bilibili.com/x/web-interface/nav",
+        headers={
+            **_DEFAULT_HTTP_HEADERS,
+            "Cookie": cookie_header,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        result["error"] = f"调用 B站 API 失败: {exc}"
+        return result
+    except Exception as exc:
+        result["error"] = f"解析 B站响应失败: {exc}"
+        return result
+
+    # `code` is 0 on success, -101 on "not logged in" (anonymous). We treat
+    # -101 as a successful probe with `logged_in=False` so the user still
+    # learns the cookies were read but didn't include a valid session.
+    code = payload.get("code")
+    data = payload.get("data") or {}
+    if code == -101:
+        result["ok"] = True
+        return result
+    if code != 0:
+        result["error"] = f"B站返回错误 code={code}: {payload.get('message')}"
+        return result
+
+    result["ok"] = True
+    result["logged_in"] = bool(data.get("isLogin"))
+    result["username"] = data.get("uname")
+    # `vipStatus`: 1 = active VIP, 0 = expired / never. `vipType`: 1 = 月度,
+    # 2 = 年度 / 长期. The label object usually has `text` like "大会员".
+    result["is_vip"] = (data.get("vipStatus") == 1)
+    label_obj = data.get("vip_label") or data.get("vip") or {}
+    if isinstance(label_obj, dict):
+        result["vip_label"] = label_obj.get("text") or label_obj.get("label")
+    if result["is_vip"] and not result["vip_label"]:
+        result["vip_label"] = "大会员"
+    return result
+
+
+def parse_url(
+    url: str,
+    cookies_from_browser: Optional[str] = None,
+    on_entry: Optional[Callable[[int, int, dict[str, Any]], None]] = None,
+) -> dict[str, Any]:
+    """Parse a Bilibili URL.
+
+    For playlist / bangumi URLs the per-entry detail fetch (`_enrich_entries`)
+    is the slow part — dozens of episodes × ~1 RTT each. When `on_entry` is
+    given, every entry is shaped immediately and the callback fires after the
+    entry's detail metadata lands, so the UI can render the table progressively
+    instead of waiting for the whole season.
+
+    `on_entry(index, total, entry)` is called from the same thread; the
+    callback is responsible for any cross-thread serialization (the sidecar's
+    `emit()` already takes the stdout lock).
+    """
     opts: dict[str, Any] = {
         # Resolve playlist/collection containers but leave entries flat — we
         # only want titles/ids for the UI's "select episode" step.
@@ -91,7 +201,7 @@ def parse_url(url: str, cookies_from_browser: Optional[str] = None) -> dict[str,
         info = ydl.extract_info(url, download=False)
     shaped = _shape(info or {})
     if shaped.get("is_playlist") and shaped.get("entries"):
-        _enrich_entries(shaped["entries"], cookies_from_browser)
+        _enrich_entries(shaped["entries"], cookies_from_browser, on_entry=on_entry)
     return shaped
 
 
@@ -226,6 +336,7 @@ def _format_label(f: dict[str, Any]) -> Optional[str]:
 def _enrich_entries(
     entries: list[dict[str, Any]],
     cookies_from_browser: Optional[str],
+    on_entry: Optional[Callable[[int, int, dict[str, Any]], None]] = None,
 ) -> None:
     """Resolve playlist entries once so the UI can show duration and quality.
 
@@ -233,6 +344,10 @@ def _enrich_entries(
     bangumi/season downloads, users need to know what their current cookies can
     actually access, so we pay the extra metadata requests here and keep the
     downloaded media untouched (`skip_download=True`).
+
+    When `on_entry` is provided, it's invoked after every entry resolves
+    (regardless of success/failure) — caller can stream `parse_progress`
+    events from here without waiting for the whole season.
     """
     opts: dict[str, Any] = {
         "skip_download": True,
@@ -243,18 +358,23 @@ def _enrich_entries(
     }
     _apply_cookies(opts, cookies_from_browser)
 
+    total = len(entries)
     with YoutubeDL(opts) as ydl:
-        for entry in entries:
+        for idx, entry in enumerate(entries):
             entry["detail_status"] = "pending"
             detail_url = entry.get("url")
             if not detail_url:
                 entry["detail_status"] = "missing_url"
+                if on_entry:
+                    on_entry(idx, total, entry)
                 continue
             try:
                 detail = ydl.extract_info(detail_url, download=False) or {}
             except Exception as exc:
                 entry["detail_status"] = "error"
                 entry["detail_error"] = str(exc)
+                if on_entry:
+                    on_entry(idx, total, entry)
                 continue
 
             entry["detail_status"] = "ok"
@@ -264,12 +384,15 @@ def _enrich_entries(
             best = _best_video_format(detail.get("formats") or [])
             if not best:
                 entry["detail_status"] = "no_formats"
-                continue
-            entry["best_format_id"] = best.get("format_id")
-            entry["best_format_note"] = _format_label(best)
-            entry["best_width"] = best.get("width")
-            entry["best_height"] = best.get("height")
-            entry["best_quality"] = best.get("quality")
+            else:
+                entry["best_format_id"] = best.get("format_id")
+                entry["best_format_note"] = _format_label(best)
+                entry["best_width"] = best.get("width")
+                entry["best_height"] = best.get("height")
+                entry["best_quality"] = best.get("quality")
+
+            if on_entry:
+                on_entry(idx, total, entry)
 
 
 def _shape(info: dict[str, Any]) -> dict[str, Any]:

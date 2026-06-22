@@ -12,7 +12,7 @@ import time
 from typing import Any, Iterator
 
 from .io import emit, log_stderr
-from .ytdlp import CancelRequested, download_video, parse_url
+from .ytdlp import CancelRequested, check_cookies, download_video, parse_url
 
 # Active downloads keyed by request id.
 _active_jobs: dict[Any, threading.Event] = {}
@@ -27,13 +27,46 @@ def dispatch(req: dict[str, Any]) -> Iterator[dict[str, Any]]:
         yield {"id": rid, "type": "pong", "ts": time.time()}
         return
 
+    if cmd == "check_cookies":
+        cookies_from_browser = args.get("cookies_from_browser")
+        status = check_cookies(cookies_from_browser)
+        yield {"id": rid, "type": "result", "data": status}
+        return
+
     if cmd == "parse":
         url = args.get("url")
         cookies_from_browser = args.get("cookies_from_browser")
         if not url or not isinstance(url, str):
             yield {"id": rid, "type": "error", "error": "missing or invalid 'url'"}
             return
-        info = parse_url(url, cookies_from_browser=cookies_from_browser)
+
+        # Acknowledge the request synchronously so the frontend can subscribe
+        # to `parse_progress` events before the sidecar starts the HTTP work
+        # that produces them. Without this, the listener might miss the first
+        # few entries on a fast-resolving small playlist.
+        emit({"id": rid, "type": "parse_started"})
+
+        # Per-entry callback: emit a `parse_progress` event so the UI can
+        # update the entry table incrementally. Uses the same id as the
+        # eventual `result`; the Rust shell forwards non-terminal types
+        # (anything that isn't `result`/`error`) to the frontend event bus
+        # without consuming the request's pending oneshot.
+        def _on_entry(index: int, total: int, entry: dict[str, Any]) -> None:
+            emit({
+                "id": rid,
+                "type": "parse_progress",
+                "data": {
+                    "index": index,
+                    "total": total,
+                    "entry": entry,
+                },
+            })
+
+        info = parse_url(
+            url,
+            cookies_from_browser=cookies_from_browser,
+            on_entry=_on_entry,
+        )
         yield {"id": rid, "type": "result", "data": info}
         return
 

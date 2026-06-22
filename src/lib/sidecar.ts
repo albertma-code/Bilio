@@ -21,6 +21,25 @@ export interface DownloadProgress {
   percent: string;
 }
 
+/** Per-entry parse progress event. Mirrors the `parse_progress` payload
+ *  emitted by the sidecar while `_enrich_entries` resolves each episode. */
+export interface ParseProgressEvent {
+  index: number;
+  total: number;
+  entry: ParsedEntry;
+}
+
+/** Result of `check_cookies` — what the Bilibili nav API says about the
+ *  user's session, packaged with a probe-level `ok`/`error`. */
+export interface CookieStatus {
+  ok: boolean;
+  logged_in: boolean;
+  username: string | null;
+  is_vip: boolean;
+  vip_label: string | null;
+  error: string | null;
+}
+
 // ── Parse types (mirror _shape() in ytdlp.py) ──────────────────────────
 
 export interface ParsedFormat {
@@ -85,18 +104,58 @@ export interface ParsedVideo {
 // ── Invoke wrappers ────────────────────────────────────────────────────
 
 /**
- * Parse a Bilibili URL and return structured metadata.
- * Throws on error — callers surface via Naive UI's notification.
+ * Parse a Bilibili URL.
  *
- * `cookiesFromBrowser` (chrome|safari|firefox|edge|brave|…) makes yt-dlp
- * read the user's logged-in cookies so private / premium-quality content
- * resolves. Anonymous parse omits it.
+ * Streaming flow:
+ *  1. We subscribe to `sidecar://message` FIRST and capture events whose id
+ *     matches our pending request — done before `invoke` so no event can
+ *     slip through between `start_parse` returning the id and the listener
+ *     attaching.
+ *  2. `invoke("start_parse")` returns a `job_id` immediately.
+ *  3. The sidecar emits `parse_started` → `parse_progress` × N → terminal
+ *     `result`/`error`. We dispatch matching events to `onProgress` and
+ *     resolve the promise on the terminal message.
+ *
+ * `cookiesFromBrowser` makes yt-dlp read the user's logged-in cookies so
+ * private / premium-quality content resolves. Anonymous parse omits it.
  */
-export function parseUrl(
+export async function parseUrl(
   url: string,
   cookiesFromBrowser?: string,
+  onProgress?: (e: ParseProgressEvent) => void,
 ): Promise<ParsedVideo> {
-  return invoke<ParsedVideo>("parse_url", { url, cookiesFromBrowser });
+  // Capture events whose id matches our (not-yet-known) job before invoking,
+  // because the sidecar may start streaming before this async function gets
+  // back the id and could subscribe a second time.
+  let jobId: number | null = null;
+  let resolveResult: ((v: ParsedVideo) => void) | null = null;
+  let rejectResult: ((e: Error) => void) | null = null;
+  const resultPromise = new Promise<ParsedVideo>((res, rej) => {
+    resolveResult = res;
+    rejectResult = rej;
+  });
+
+  const unlisten = await onSidecarMessage((msg) => {
+    if (jobId == null || msg.id !== jobId) return;
+    if (msg.type === "parse_progress") {
+      const data = msg.data as ParseProgressEvent | undefined;
+      if (data && onProgress) onProgress(data);
+    } else if (msg.type === "result") {
+      resolveResult?.((msg.data as ParsedVideo) ?? (msg as unknown as ParsedVideo));
+    } else if (msg.type === "error") {
+      rejectResult?.(new Error(String(msg.error ?? "解析失败")));
+    }
+  });
+
+  try {
+    jobId = await invoke<number>("start_parse", {
+      url,
+      cookiesFromBrowser: cookiesFromBrowser ?? null,
+    });
+    return await resultPromise;
+  } finally {
+    unlisten();
+  }
 }
 
 export interface PongResponse {
@@ -107,6 +166,16 @@ export interface PongResponse {
 
 export function pingSidecar(): Promise<PongResponse> {
   return invoke<PongResponse>("ping_sidecar");
+}
+
+/** Check whether the chosen browser's Bilibili cookies represent a
+ *  logged-in session. Returns the full status dict — non-VIP, logged-out,
+ *  and brand-new-or-no-browser sessions all return a valid shape rather
+ *  than throwing, so callers can render the badge unconditionally. */
+export function checkCookies(cookiesFromBrowser?: string): Promise<CookieStatus> {
+  return invoke<CookieStatus>("check_cookies", {
+    cookiesFromBrowser: cookiesFromBrowser ?? null,
+  });
 }
 
 /**

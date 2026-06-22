@@ -97,14 +97,17 @@ fn spawn_sidecar(app: &AppHandle, state: &SidecarState) -> Result<(), String> {
 }
 
 /// Parse one JSONL line from the sidecar and either resolve a pending request
-/// (when `id` is a number we issued AND no later messages for that id are
-/// expected) or emit it to the frontend as an event.
+/// or forward it to the frontend as an event.
+///
+/// Terminal messages (`type == "result"` or `"error"`) consume the pending
+/// oneshot for their id. Non-terminal messages (`progress`, `parse_progress`,
+/// future streaming types) keep the pending entry alive and fall through to
+/// the `sidecar://message` event bus so the UI can react incrementally.
 ///
 /// Note: long-running commands (`download`) emit MULTIPLE messages for the
 /// same id — first a `result` with `status: "started"` (consumed by the
 /// awaiting invoke), then a stream of `progress`/terminal `result`/`error`.
-/// We resolve the pending oneshot on the FIRST matching response; the rest
-/// arrive after pending is gone and fall through to the event channel below.
+/// Once pending is removed, follow-ups fall through to the event channel.
 fn handle_sidecar_line(app: &AppHandle, line: &str) {
     if line.is_empty() {
         return;
@@ -117,15 +120,21 @@ fn handle_sidecar_line(app: &AppHandle, line: &str) {
         }
     };
 
-    if let Some(id) = msg.get("id").and_then(Value::as_u64) {
-        let state: State<SidecarState> = app.state();
-        let maybe_tx = state.pending.lock().unwrap().remove(&id);
-        if let Some(tx) = maybe_tx {
-            let _ = tx.send(msg);
-            return;
+    let msg_type = msg.get("type").and_then(Value::as_str).unwrap_or("");
+    let is_terminal = matches!(msg_type, "result" | "error" | "pong");
+
+    if is_terminal {
+        if let Some(id) = msg.get("id").and_then(Value::as_u64) {
+            let state: State<SidecarState> = app.state();
+            let maybe_tx = state.pending.lock().unwrap().remove(&id);
+            if let Some(tx) = maybe_tx {
+                let _ = tx.send(msg);
+                return;
+            }
+            // No pending sender — streaming follow-up after the awaiting
+            // invoke already resolved (e.g. download terminal status).
+            // Fall through and emit to the frontend.
         }
-        // No pending sender — this is a streaming follow-up (download
-        // progress / terminal status). Fall through to emit to the frontend.
     }
 
     // Forward as a frontend event. UI listeners filter by `type` and `id`.
@@ -175,18 +184,60 @@ async fn ping_sidecar(state: State<'_, SidecarState>) -> Result<Value, String> {
     request(&state, "ping", Value::Null).await
 }
 
+/// Start a parse. Returns the `job_id` (== request id) the frontend uses to
+/// filter `parse_progress` + terminal `result`/`error` events on the
+/// `sidecar://message` channel.
+///
+/// The parse must be two-step (id-out then stream-in) so the frontend can
+/// subscribe before the first `parse_progress` event fires — the sidecar
+/// emits one per resolved entry while it's still inside the call, so an
+/// invoke that returned the final result would have already shipped every
+/// progress event the UI wanted to see.
 #[tauri::command]
-async fn parse_url(
+async fn start_parse(
     url: String,
     cookies_from_browser: Option<String>,
     state: State<'_, SidecarState>,
-) -> Result<Value, String> {
-    let args = serde_json::json!({
-        "url": url,
-        "cookies_from_browser": cookies_from_browser,
+) -> Result<u64, String> {
+    let id = state.alloc_id();
+    // No pending oneshot — the frontend listens for the terminal `result`
+    // on the `sidecar://message` bus directly, same as it does for download
+    // progress streams.
+
+    let payload = serde_json::json!({
+        "id": id,
+        "cmd": "parse",
+        "args": {
+            "url": url,
+            "cookies_from_browser": cookies_from_browser,
+        }
     });
-    let resp = request(&state, "parse", args).await?;
-    // For commands that return data, hand the frontend just the `data` slice.
+    let line = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+
+    {
+        let mut guard = state.child.lock().unwrap();
+        let child = guard
+            .as_mut()
+            .ok_or_else(|| "sidecar not running".to_string())?;
+        child
+            .write(format!("{line}\n").as_bytes())
+            .map_err(|e| format!("failed to write to sidecar stdin: {e}"))?;
+    }
+
+    Ok(id)
+}
+
+/// Probe whether the selected browser's Bilibili cookies represent a real
+/// logged-in session. Returns the sidecar's status dict verbatim — see
+/// `ytdlp.check_cookies` for the shape (`logged_in`, `username`, `is_vip`,
+/// `vip_label`, `error`).
+#[tauri::command]
+async fn check_cookies(
+    cookies_from_browser: Option<String>,
+    state: State<'_, SidecarState>,
+) -> Result<Value, String> {
+    let args = serde_json::json!({ "cookies_from_browser": cookies_from_browser });
+    let resp = request(&state, "check_cookies", args).await?;
     Ok(resp.get("data").cloned().unwrap_or(resp))
 }
 
@@ -268,7 +319,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             ping_sidecar,
-            parse_url,
+            start_parse,
+            check_cookies,
             download_video,
             cancel_download
         ])

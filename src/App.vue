@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { onMounted, ref, watch } from "vue";
 import {
   NButton,
   NConfigProvider,
@@ -13,12 +13,18 @@ import {
   NLayoutHeader,
   NMessageProvider,
   NSelect,
+  NSpin,
   NTag,
   dateZhCN,
   zhCN,
 } from "naive-ui";
 import MainArea from "./components/MainArea.vue";
-import { onSidecarMessage, type SidecarMessage } from "./lib/sidecar";
+import {
+  checkCookies,
+  onSidecarMessage,
+  type CookieStatus,
+  type SidecarMessage,
+} from "./lib/sidecar";
 
 const sidecarReady = ref(false);
 const settingsOpen = ref(false);
@@ -26,6 +32,10 @@ const downloadDir = ref(localStorage.getItem("yabi-download-dir") ?? "~/Download
 const cookiesBrowser = ref<string | null>(
   localStorage.getItem("yabi-cookies-browser") || null,
 );
+
+/** Result of the most recent `check_cookies` probe. */
+const cookieStatus = ref<CookieStatus | null>(null);
+const cookieStatusLoading = ref(false);
 
 const browserOptions = [
   { label: "无（匿名）", value: "" },
@@ -39,8 +49,40 @@ const browserOptions = [
 
 onMounted(async () => {
   await onSidecarMessage((msg: SidecarMessage) => {
-    if (msg.type === "ready") sidecarReady.value = true;
+    if (msg.type === "ready") {
+      sidecarReady.value = true;
+      // Probe initial cookie status if a browser is already configured.
+      if (cookiesBrowser.value) probeCookies();
+    }
   });
+});
+
+async function probeCookies() {
+  if (!cookiesBrowser.value) {
+    cookieStatus.value = null;
+    return;
+  }
+  cookieStatusLoading.value = true;
+  try {
+    cookieStatus.value = await checkCookies(cookiesBrowser.value);
+  } catch (e: any) {
+    cookieStatus.value = {
+      ok: false,
+      logged_in: false,
+      username: null,
+      is_vip: false,
+      vip_label: null,
+      error: typeof e === "string" ? e : e?.message ?? "读取失败",
+    };
+  } finally {
+    cookieStatusLoading.value = false;
+  }
+}
+
+// Re-probe whenever the user changes the cookies browser.
+watch(cookiesBrowser, (val) => {
+  if (val && sidecarReady.value) probeCookies();
+  else cookieStatus.value = null;
 });
 
 function saveDownloadDir(val: string) {
@@ -99,6 +141,42 @@ function saveCookiesBrowser(val: string | null) {
                 size="small"
                 @update:value="saveCookiesBrowser"
               />
+              <div v-if="cookiesBrowser" class="cookie-status">
+                <n-spin v-if="cookieStatusLoading" size="small" />
+                <template v-else-if="cookieStatus">
+                  <n-tag
+                    v-if="cookieStatus.logged_in"
+                    :type="cookieStatus.is_vip ? 'success' : 'info'"
+                    size="small"
+                    round
+                  >
+                    {{
+                      cookieStatus.is_vip
+                        ? `已登录 ${cookieStatus.username} · ${cookieStatus.vip_label}`
+                        : `已登录 ${cookieStatus.username}`
+                    }}
+                  </n-tag>
+                  <n-tag
+                    v-else-if="cookieStatus.ok"
+                    type="warning"
+                    size="small"
+                    round
+                  >
+                    Cookies 已读取，但未登录
+                  </n-tag>
+                  <n-tag v-else type="error" size="small" round>
+                    {{ cookieStatus.error ?? "读取失败" }}
+                  </n-tag>
+                  <n-button
+                    quaternary
+                    size="tiny"
+                    style="margin-left: 0.4rem"
+                    @click="probeCookies"
+                  >
+                    重新检测
+                  </n-button>
+                </template>
+              </div>
             </n-descriptions-item>
             <n-descriptions-item label="ffmpeg">
               <n-tag size="small" type="info">imageio-ffmpeg 自动捆绑</n-tag>
@@ -161,6 +239,13 @@ function saveCookiesBrowser(val: string | null) {
   font-size: 0.8rem;
   color: #888;
   margin-top: 1rem;
+}
+.cookie-status {
+  margin-top: 0.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  flex-wrap: wrap;
 }
 </style>
 <style>
