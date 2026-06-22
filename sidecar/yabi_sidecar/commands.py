@@ -29,10 +29,11 @@ def dispatch(req: dict[str, Any]) -> Iterator[dict[str, Any]]:
 
     if cmd == "parse":
         url = args.get("url")
+        cookies_from_browser = args.get("cookies_from_browser")
         if not url or not isinstance(url, str):
             yield {"id": rid, "type": "error", "error": "missing or invalid 'url'"}
             return
-        info = parse_url(url)
+        info = parse_url(url, cookies_from_browser=cookies_from_browser)
         yield {"id": rid, "type": "result", "data": info}
         return
 
@@ -40,6 +41,7 @@ def dispatch(req: dict[str, Any]) -> Iterator[dict[str, Any]]:
         url = args.get("url")
         format_id = args.get("format_id")
         output_dir = os.path.expanduser(args.get("output_dir") or "~/Downloads/Yabi")
+        cookies_from_browser = args.get("cookies_from_browser")
         if not url or not isinstance(url, str):
             yield {"id": rid, "type": "error", "error": "missing or invalid 'url'"}
             return
@@ -62,6 +64,7 @@ def dispatch(req: dict[str, Any]) -> Iterator[dict[str, Any]]:
                     output_dir=output_dir,
                     progress_callback=_make_progress_cb(rid),
                     cancel_event=cancel_ev,
+                    cookies_from_browser=cookies_from_browser,
                 )
                 emit({
                     "id": rid,

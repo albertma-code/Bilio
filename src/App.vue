@@ -12,6 +12,7 @@ import {
   NLayoutContent,
   NLayoutHeader,
   NMessageProvider,
+  NSelect,
   NTag,
   dateZhCN,
   zhCN,
@@ -22,6 +23,19 @@ import { onSidecarMessage, type SidecarMessage } from "./lib/sidecar";
 const sidecarReady = ref(false);
 const settingsOpen = ref(false);
 const downloadDir = ref(localStorage.getItem("yabi-download-dir") ?? "~/Downloads/Yabi");
+const cookiesBrowser = ref<string | null>(
+  localStorage.getItem("yabi-cookies-browser") || null,
+);
+
+const browserOptions = [
+  { label: "无（匿名）", value: "" },
+  { label: "Safari", value: "safari" },
+  { label: "Chrome", value: "chrome" },
+  { label: "Firefox", value: "firefox" },
+  { label: "Edge", value: "edge" },
+  { label: "Brave", value: "brave" },
+  { label: "Chromium", value: "chromium" },
+];
 
 onMounted(async () => {
   await onSidecarMessage((msg: SidecarMessage) => {
@@ -32,6 +46,12 @@ onMounted(async () => {
 function saveDownloadDir(val: string) {
   downloadDir.value = val;
   localStorage.setItem("yabi-download-dir", val);
+}
+
+function saveCookiesBrowser(val: string | null) {
+  cookiesBrowser.value = val || null;
+  if (val) localStorage.setItem("yabi-cookies-browser", val);
+  else localStorage.removeItem("yabi-cookies-browser");
 }
 </script>
 
@@ -54,11 +74,14 @@ function saveDownloadDir(val: string) {
           </div>
         </n-layout-header>
         <n-layout-content class="content">
-          <MainArea :download-dir="downloadDir" />
+          <MainArea
+            :download-dir="downloadDir"
+            :cookies-browser="cookiesBrowser || undefined"
+          />
         </n-layout-content>
       </n-layout>
 
-      <n-drawer v-model:show="settingsOpen" :width="360" placement="right">
+      <n-drawer v-model:show="settingsOpen" :width="380" placement="right">
         <n-drawer-content title="设置" closable>
           <n-descriptions :columns="1" label-placement="top" bordered size="small">
             <n-descriptions-item label="下载目录">
@@ -69,12 +92,21 @@ function saveDownloadDir(val: string) {
                 size="small"
               />
             </n-descriptions-item>
+            <n-descriptions-item label="使用浏览器 Cookies（解锁会员清晰度）">
+              <n-select
+                :value="cookiesBrowser ?? ''"
+                :options="browserOptions"
+                size="small"
+                @update:value="saveCookiesBrowser"
+              />
+            </n-descriptions-item>
             <n-descriptions-item label="ffmpeg">
-              <n-tag size="small" type="info">imageio-ffmpeg 自动定位</n-tag>
+              <n-tag size="small" type="info">imageio-ffmpeg 自动捆绑</n-tag>
             </n-descriptions-item>
           </n-descriptions>
           <p class="settings-note">
-            下载目录通过 localStorage 持久化。ffmpeg 由 imageio-ffmpeg 自动定位。
+            选择浏览器后，Yabi 会读取该浏览器中已登录 B站的 cookies，从而解析/下载
+            会员清晰度或仅登录可见的视频。Cookies 仅在本机使用，不上传任何位置。
           </p>
         </n-drawer-content>
       </n-drawer>

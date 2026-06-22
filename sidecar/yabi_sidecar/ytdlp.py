@@ -55,7 +55,27 @@ def _get_ffmpeg_path() -> Optional[str]:
         return None
 
 
-def parse_url(url: str) -> dict[str, Any]:
+def _apply_cookies(opts: dict[str, Any], cookies_from_browser: Optional[str]) -> None:
+    """Wire yt-dlp's cookiesfrombrowser into `opts` if a browser is given.
+
+    yt-dlp expects a tuple `(browser_name, profile, keyring, container)`; we
+    pass just the browser name (most common case). Empty/None means no cookies.
+    Supported browsers: chrome, chromium, brave, edge, firefox, opera, safari,
+    vivaldi, whale. Anything else is silently ignored — the download just runs
+    anonymous, same as before.
+    """
+    if not cookies_from_browser:
+        return
+    if cookies_from_browser not in {
+        "chrome", "chromium", "brave", "edge", "firefox",
+        "opera", "safari", "vivaldi", "whale",
+    }:
+        return
+    # yt-dlp accepts a tuple here; only the first element is required.
+    opts["cookiesfrombrowser"] = (cookies_from_browser,)
+
+
+def parse_url(url: str, cookies_from_browser: Optional[str] = None) -> dict[str, Any]:
     opts: dict[str, Any] = {
         # Resolve playlist/collection containers but leave entries flat — we
         # only want titles/ids for the UI's "select episode" step.
@@ -66,6 +86,7 @@ def parse_url(url: str) -> dict[str, Any]:
         "noplaylist": False,
         "http_headers": _DEFAULT_HTTP_HEADERS,
     }
+    _apply_cookies(opts, cookies_from_browser)
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     return _shape(info or {})
@@ -77,6 +98,7 @@ def download_video(
     output_dir: str,
     progress_callback: Callable[[dict[str, Any]], None],
     cancel_event: threading.Event,
+    cookies_from_browser: Optional[str] = None,
 ) -> Optional[str]:
     """Download `url` at `format_id` into `output_dir`.
 
@@ -114,6 +136,8 @@ def download_video(
     if ffmpeg_path:
         opts["ffmpeg_location"] = ffmpeg_path
 
+    _apply_cookies(opts, cookies_from_browser)
+
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         # yt-dlp puts the final merged path in `requested_downloads`.
@@ -125,12 +149,29 @@ def download_video(
     return None
 
 
+def _entry_title(e: dict[str, Any], idx: int) -> Optional[str]:
+    """Best-effort title for a flat-extracted entry.
+
+    yt-dlp's `extract_flat="in_playlist"` populates `url` but typically leaves
+    `title`/`id` empty for Bilibili anthology entries. We fall back to the
+    `?p=N` page index parsed from the URL so the UI shows something useful.
+    """
+    if e.get("title"):
+        return e["title"]
+    url = e.get("url") or ""
+    if "?p=" in url:
+        p = url.split("?p=", 1)[1].split("&", 1)[0]
+        return f"P{p}"
+    return f"第 {idx + 1} 集"
+
+
 def _shape(info: dict[str, Any]) -> dict[str, Any]:
     """Trim a yt-dlp info dict to a UI-friendly subset.
 
     The raw dict is huge (tens of KB of internal fields); we forward only what
     the parser screen actually renders. Add fields here as the UI grows.
     """
+    raw_entries = info.get("entries") or []
     return {
         "title": info.get("title"),
         "uploader": info.get("uploader"),
@@ -140,12 +181,12 @@ def _shape(info: dict[str, Any]) -> dict[str, Any]:
         "is_playlist": info.get("_type") == "playlist",
         "entries": [
             {
-                "id": e.get("id"),
-                "title": e.get("title"),
+                "id": e.get("id") or (e.get("url") or "").split("?p=", 1)[-1] or f"_idx_{idx}",
+                "title": _entry_title(e, idx),
                 "duration": e.get("duration"),
                 "url": e.get("url"),
             }
-            for e in (info.get("entries") or [])
+            for idx, e in enumerate(raw_entries)
         ],
         "formats": [
             {

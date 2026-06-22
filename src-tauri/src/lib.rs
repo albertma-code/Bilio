@@ -176,8 +176,16 @@ async fn ping_sidecar(state: State<'_, SidecarState>) -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn parse_url(url: String, state: State<'_, SidecarState>) -> Result<Value, String> {
-    let resp = request(&state, "parse", serde_json::json!({ "url": url })).await?;
+async fn parse_url(
+    url: String,
+    cookies_from_browser: Option<String>,
+    state: State<'_, SidecarState>,
+) -> Result<Value, String> {
+    let args = serde_json::json!({
+        "url": url,
+        "cookies_from_browser": cookies_from_browser,
+    });
+    let resp = request(&state, "parse", args).await?;
     // For commands that return data, hand the frontend just the `data` slice.
     Ok(resp.get("data").cloned().unwrap_or(resp))
 }
@@ -196,6 +204,7 @@ async fn download_video(
     url: String,
     format_id: String,
     output_dir: String,
+    cookies_from_browser: Option<String>,
     state: State<'_, SidecarState>,
 ) -> Result<u64, String> {
     let id = state.alloc_id();
@@ -205,7 +214,12 @@ async fn download_video(
     let payload = serde_json::json!({
         "id": id,
         "cmd": "download",
-        "args": { "url": url, "format_id": format_id, "output_dir": output_dir }
+        "args": {
+            "url": url,
+            "format_id": format_id,
+            "output_dir": output_dir,
+            "cookies_from_browser": cookies_from_browser,
+        }
     });
     let line = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
 

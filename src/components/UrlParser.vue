@@ -4,12 +4,15 @@ import {
   NAlert,
   NButton,
   NCard,
+  NCheckbox,
   NDataTable,
   NDescriptions,
   NDescriptionsItem,
   NEmpty,
   NImage,
   NInput,
+  NSelect,
+  NSpace,
   NSpin,
   NTag,
   useMessage,
@@ -18,9 +21,12 @@ import {
 import {
   formatDuration,
   parseUrl,
+  type ParsedEntry,
   type ParsedFormat,
   type ParsedVideo,
 } from "../lib/sidecar";
+
+const props = defineProps<{ cookiesBrowser?: string }>();
 
 const url = ref("");
 const loading = ref(false);
@@ -28,10 +34,33 @@ const error = ref<string | null>(null);
 const info = ref<ParsedVideo | null>(null);
 const message = useMessage();
 
+/** Selected entry ids when info is a playlist. Used by batch download. */
+const selectedEntryIds = ref<Array<string | null>>([]);
+
+/**
+ * Batch quality selection. Maps to yt-dlp's format spec — for collections
+ * the per-entry format ids are unknown until each one is resolved, so we
+ * use a generic "best video ≤ N height + best audio" expression.
+ */
+const batchQuality = ref<string>("bv*[height<=1080]+ba/best");
+const batchQualityOptions = [
+  { label: "最高清晰度", value: "bv*+ba/best" },
+  { label: "≤ 1080p", value: "bv*[height<=1080]+ba/best" },
+  { label: "≤ 720p", value: "bv*[height<=720]+ba/best" },
+  { label: "≤ 480p", value: "bv*[height<=480]+ba/best" },
+  { label: "≤ 360p（最小）", value: "bv*[height<=360]+ba/best" },
+];
+
 const canSubmit = computed(() => url.value.trim().length > 0 && !loading.value);
 
 const emit = defineEmits<{
   (e: "download", url: string, formatId: string, formatLabel: string): void;
+  (
+    e: "batch-download",
+    entries: Array<{ url: string; title: string }>,
+    formatId: string,
+    formatLabel: string,
+  ): void;
 }>();
 
 async function onParse() {
@@ -39,8 +68,15 @@ async function onParse() {
   loading.value = true;
   error.value = null;
   info.value = null;
+  selectedEntryIds.value = [];
   try {
-    info.value = await parseUrl(url.value.trim());
+    info.value = await parseUrl(url.value.trim(), props.cookiesBrowser);
+    if (info.value?.is_playlist) {
+      // Default-select all entries — typical use case is "download whole collection".
+      selectedEntryIds.value = info.value.entries
+        .map((e) => e.id)
+        .filter((id): id is string => id != null);
+    }
     message.success("解析成功");
   } catch (e: any) {
     error.value = typeof e === "string" ? e : e?.message ?? "未知错误";
@@ -57,6 +93,45 @@ function doDownload(row: ParsedFormat) {
       ? `${row.format_note} · ${row.format_id}`
       : row.format_id ?? "unknown";
   emit("download", url.value.trim(), row.format_id ?? "", label);
+}
+
+function toggleEntry(id: string | null) {
+  if (id == null) return;
+  const i = selectedEntryIds.value.indexOf(id);
+  if (i >= 0) selectedEntryIds.value.splice(i, 1);
+  else selectedEntryIds.value.push(id);
+}
+
+function toggleAll() {
+  if (!info.value) return;
+  if (selectedEntryIds.value.length === info.value.entries.length) {
+    selectedEntryIds.value = [];
+  } else {
+    selectedEntryIds.value = info.value.entries.map((e) => e.id).filter((x): x is string => x != null);
+  }
+}
+
+const allSelected = computed(
+  () => !!info.value && selectedEntryIds.value.length === info.value.entries.length && info.value.entries.length > 0,
+);
+
+function doBatchDownload() {
+  if (!info.value) return;
+  const selected = info.value.entries.filter(
+    (e) => e.id != null && selectedEntryIds.value.includes(e.id),
+  );
+  if (!selected.length) {
+    message.warning("请先选择要下载的分集");
+    return;
+  }
+  // Each entry has its own URL (set by yt-dlp on flat extract). Fall back to
+  // the source URL — yt-dlp will then download the whole playlist via index.
+  const items = selected
+    .map((e) => ({ url: e.url ?? url.value.trim(), title: e.title ?? "(无标题)" }))
+    .filter((x) => x.url);
+  const qualityLabel =
+    batchQualityOptions.find((o) => o.value === batchQuality.value)?.label ?? batchQuality.value;
+  emit("batch-download", items, batchQuality.value, qualityLabel);
 }
 
 const formatColumns: DataTableColumns<ParsedFormat> = [
@@ -93,6 +168,30 @@ const formatColumns: DataTableColumns<ParsedFormat> = [
   },
 ];
 
+const entryColumns = computed<DataTableColumns<ParsedEntry>>(() => [
+  {
+    title: () =>
+      h(NCheckbox, {
+        checked: allSelected.value,
+        onUpdateChecked: toggleAll,
+      }),
+    key: "_select",
+    width: 50,
+    render: (row) =>
+      h(NCheckbox, {
+        checked: row.id != null && selectedEntryIds.value.includes(row.id),
+        onUpdateChecked: () => toggleEntry(row.id),
+      }),
+  },
+  { title: "#", key: "_idx", width: 50, render: (_row, idx) => idx + 1 },
+  { title: "标题", key: "title" },
+  {
+    title: "时长",
+    key: "duration",
+    width: 100,
+    render: (row) => formatDuration(row.duration),
+  },
+]);
 </script>
 
 <template>
@@ -146,6 +245,43 @@ const formatColumns: DataTableColumns<ParsedFormat> = [
           </div>
         </div>
 
+        <!-- Playlist / collection: per-entry selection + batch download -->
+        <n-descriptions
+          v-if="info.is_playlist && info.entries.length"
+          :columns="1"
+          label-placement="top"
+          bordered
+          style="margin-top: 1rem"
+        >
+          <n-descriptions-item :label="`分集列表（已选 ${selectedEntryIds.length} / ${info.entries.length}）`">
+            <n-data-table
+              :columns="entryColumns"
+              :data="info.entries"
+              :row-key="(r: ParsedEntry) => r.id ?? ''"
+              :max-height="300"
+              size="small"
+            />
+            <n-space style="margin-top: 0.75rem" align="center">
+              <span class="batch-label">清晰度</span>
+              <n-select
+                v-model:value="batchQuality"
+                :options="batchQualityOptions"
+                size="small"
+                style="width: 200px"
+              />
+              <n-button
+                type="primary"
+                size="small"
+                :disabled="!selectedEntryIds.length"
+                @click="doBatchDownload"
+              >
+                批量下载 ({{ selectedEntryIds.length }})
+              </n-button>
+            </n-space>
+          </n-descriptions-item>
+        </n-descriptions>
+
+        <!-- Single video or per-format manual select -->
         <n-descriptions
           v-if="info.formats.length"
           :columns="1"
@@ -153,7 +289,7 @@ const formatColumns: DataTableColumns<ParsedFormat> = [
           bordered
           style="margin-top: 1rem"
         >
-          <n-descriptions-item label="可选格式">
+          <n-descriptions-item :label="info.is_playlist ? '本视频可选格式（仅当前展开的视频）' : '可选格式'">
             <n-data-table
               :columns="formatColumns"
               :data="info.formats"
@@ -164,7 +300,10 @@ const formatColumns: DataTableColumns<ParsedFormat> = [
           </n-descriptions-item>
         </n-descriptions>
 
-        <n-empty v-if="!info.formats.length" description="没有解析到可用格式" />
+        <n-empty
+          v-if="!info.formats.length && !info.entries.length"
+          description="没有解析到可用格式或分集"
+        />
       </div>
     </n-spin>
   </n-card>
@@ -220,5 +359,9 @@ const formatColumns: DataTableColumns<ParsedFormat> = [
 }
 .source-link:hover {
   text-decoration: underline;
+}
+.batch-label {
+  font-size: 0.85rem;
+  color: var(--n-text-color-2, #666);
 }
 </style>

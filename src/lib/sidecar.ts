@@ -57,9 +57,16 @@ export interface ParsedVideo {
 /**
  * Parse a Bilibili URL and return structured metadata.
  * Throws on error — callers surface via Naive UI's notification.
+ *
+ * `cookiesFromBrowser` (chrome|safari|firefox|edge|brave|…) makes yt-dlp
+ * read the user's logged-in cookies so private / premium-quality content
+ * resolves. Anonymous parse omits it.
  */
-export function parseUrl(url: string): Promise<ParsedVideo> {
-  return invoke<ParsedVideo>("parse_url", { url });
+export function parseUrl(
+  url: string,
+  cookiesFromBrowser?: string,
+): Promise<ParsedVideo> {
+  return invoke<ParsedVideo>("parse_url", { url, cookiesFromBrowser });
 }
 
 export interface PongResponse {
@@ -74,7 +81,7 @@ export function pingSidecar(): Promise<PongResponse> {
 
 /**
  * Start downloading a video. Returns a `job_id` immediately (sent every
- * progress and terminal event as `msg.id`).  The download runs on the
+ * progress and terminal event as `msg.id`). The download runs on the
  * sidecar's worker thread; progress events arrive on the `sidecar://message`
  * event bus.
  */
@@ -82,8 +89,14 @@ export function downloadVideo(
   url: string,
   formatId: string,
   outputDir: string,
+  cookiesFromBrowser?: string,
 ): Promise<number> {
-  return invoke<number>("download_video", { url, formatId, outputDir });
+  return invoke<number>("download_video", {
+    url,
+    formatId,
+    outputDir,
+    cookiesFromBrowser,
+  });
 }
 
 /** Cancel a running download identified by its job_id. */
