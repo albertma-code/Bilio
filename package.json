@@ -1,15 +1,19 @@
 {
   "name": "bilio",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.4.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
+    "desktop:assets": "bash sidecar/build.sh && npm run build",
+    "release:mac": "tauri build --bundles app && bash scripts/package-macos.sh",
+    "test:sidecar": "PYTHONPATH=sidecar .venv-stable/bin/python -m unittest discover -s sidecar/tests -v",
     "preview": "vite preview",
     "tauri": "tauri"
   },
   "dependencies": {
+    "@lucide/vue": "^1.59.0",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2.5.4",
     "naive-ui": "^2.44.1",

@@ -8,13 +8,19 @@ corrupt the JSONL protocol the Rust shell reads.
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
+import sys
 import threading
+import http.cookiejar
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Optional
 
 from yt_dlp import YoutubeDL
+from .errors import user_error
+from .source import resolve_short_link
 
 # Bilibili rejects default yt-dlp User-Agent with HTTP 412. A real browser UA
 # plus `Referer` AND `Origin` headers pointing back to bilibili.com is what
@@ -32,12 +38,53 @@ _DEFAULT_HTTP_HEADERS = {
 }
 
 
+class QuietLogger:
+    def debug(self, message):
+        pass
+
+    def warning(self, message):
+        pass
+
+    def error(self, message):
+        pass
+
+
 class CancelRequested(Exception):
     """Raised from inside a progress_hook to abort the current download.
 
     yt-dlp catches this and propagates it as a normal error, which we then
     surface to the UI as a `cancelled` status (not an error).
     """
+
+
+def _check_cancel(cancel_event):
+    if cancel_event is not None and cancel_event.is_set():
+        raise CancelRequested()
+
+
+def quality_selector(policy: dict) -> str:
+    """Compile a structured policy without an unrestricted fallback."""
+    if not isinstance(policy, dict):
+        raise ValueError("缺少清晰度策略")
+    mode = policy.get("mode")
+    if mode == "best":
+        return "bv+ba/b"
+    if mode == "max_height":
+        height = policy.get("height")
+        if type(height) is not int or height not in (360, 480, 720, 1080, 2160):
+            raise ValueError("无效的像素高度限制")
+        return f"bv[height<={height}]+ba/b[height<={height}]"
+    if mode == "max_quality":
+        quality = policy.get("quality")
+        if type(quality) is not int or quality not in (16, 32, 64, 80, 120):
+            raise ValueError("无效的 B站画质档位")
+        return f"bv[quality<={quality}]+ba/b[quality<={quality}]"
+    if mode == "exact":
+        fmt = policy.get("format_id")
+        if not isinstance(fmt, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", fmt):
+            raise ValueError("无效的指定格式")
+        return f"{fmt}+ba/{fmt}[acodec!=none]"
+    raise ValueError("不支持的清晰度策略")
 
 
 def _get_ffmpeg_path() -> Optional[str]:
@@ -58,27 +105,110 @@ def _get_ffmpeg_path() -> Optional[str]:
         return None
 
 
-def _apply_cookies(opts: dict[str, Any], cookies_from_browser: Optional[str]) -> None:
+class DownloadProgressTracker:
+    """Aggregate the selected streams and keep protocol messages credential-free."""
+    def __init__(self, info, callback):
+        self.callback = callback
+        self.streams = {str(f.get("format_id")): {"bytes": 0, "total": f.get("filesize") or f.get("filesize_approx")}
+                        for f in (info.get("requested_formats") or [info])}
+        self.percent = 0
+        self.actual_quality = info.get("format") or info.get("format_id")
+
+    def hook(self, data):
+        details = data.get("info_dict") or {}
+        stream_id = str(details.get("format_id"))
+        if stream_id not in self.streams and len(self.streams) == 1:
+            stream_id = next(iter(self.streams))
+        stream = self.streams.setdefault(stream_id, {"bytes": 0, "total": None})
+        stream["bytes"] = max(stream["bytes"], data.get("downloaded_bytes") or 0)
+        stream["total"] = data.get("total_bytes") or data.get("total_bytes_estimate") or stream["total"]
+        self.publish("downloading", data)
+
+    def publish(self, status, data=None):
+        data = data or {}
+        downloaded = sum(s["bytes"] for s in self.streams.values())
+        totals = [s["total"] for s in self.streams.values()]
+        total = sum(totals) if all(totals) else None
+        if total:
+            self.percent = max(self.percent, min(99, int(downloaded / total * 99)))
+        if status == "processing":
+            self.percent = max(self.percent, 99)
+        speed = data.get("speed")
+        self.callback({"status": status, "overall_percent": self.percent if total or status == "processing" else None,
+            "downloaded_bytes": downloaded, "total_bytes": total, "speed": speed,
+            "eta": max(0, int((total - downloaded) / speed)) if total and speed else None,
+            "filename": os.path.basename(data.get("filename") or ""), "actual_quality": self.actual_quality})
+
+
+def _apply_cookies(opts: dict[str, Any], cookies_from_browser: Optional[str], session_cookies=None) -> None:
     """Wire yt-dlp's cookiesfrombrowser into `opts` if a browser is given.
 
     yt-dlp expects a tuple `(browser_name, profile, keyring, container)`; we
     pass just the browser name (most common case). Empty/None means no cookies.
     Supported browsers: chrome, chromium, brave, edge, firefox, opera, safari,
-    vivaldi, whale. Anything else is silently ignored — the download just runs
-    anonymous, same as before.
+    vivaldi, whale. Unsupported names are rejected rather than made anonymous.
     """
+    if cookies_from_browser == "bilio":
+        # Use CookieJar rather than a broad Cookie header, so unrelated hosts
+        # and redirects never receive Bilibili credentials.
+        return
     if not cookies_from_browser:
         return
     if cookies_from_browser not in {
         "chrome", "chromium", "brave", "edge", "firefox",
         "opera", "safari", "vivaldi", "whale",
     }:
-        return
+        raise ValueError("不支持所选浏览器，请重新选择浏览器")
+    access_error = _cookie_access_error(cookies_from_browser)
+    if access_error:
+        raise ValueError(access_error)
     # yt-dlp accepts a tuple here; only the first element is required.
     opts["cookiesfrombrowser"] = (cookies_from_browser,)
 
 
-def check_cookies(cookies_from_browser: Optional[str]) -> dict[str, Any]:
+def _cookie_access_error(browser):
+    if sys.platform != "darwin":
+        return None
+    roots = {"chrome": "~/Library/Application Support/Google/Chrome",
+             "edge": "~/Library/Application Support/Microsoft Edge",
+             "brave": "~/Library/Application Support/BraveSoftware/Brave-Browser",
+             "chromium": "~/Library/Application Support/Chromium",
+             "firefox": "~/Library/Application Support/Firefox/Profiles",
+             "safari": "~/Library/Cookies"}
+    root = roots.get(browser)
+    if not root:
+        return None
+    try:
+        with os.scandir(os.path.expanduser(root)) as entries:
+            next(entries, None)
+    except PermissionError:
+        return "macOS 阻止读取浏览器数据。请在系统设置 → 隐私与安全性 → 完全磁盘访问权限中允许 Bilio，然后重启应用。"
+    except FileNotFoundError:
+        return "没有找到所选浏览器的数据。请先在该浏览器登录 B站，或选择实际使用的浏览器。"
+    return None
+
+
+def _session_jar(cookies):
+    from .auth import validate_cookies
+    jar = http.cookiejar.CookieJar()
+    for cookie in validate_cookies(cookies):
+        expires = cookie.get("expires")
+        jar.set_cookie(http.cookiejar.Cookie(0, cookie["name"], cookie["value"], None, False,
+            cookie["domain"], True, cookie["domain"].startswith("."), cookie["path"], True,
+            cookie["secure"], int(expires) if expires else None, not bool(expires), None, None, {}, False))
+    return jar
+
+
+def _apply_session(ydl, browser, cookies):
+    if browser == "bilio":
+        if cookies is None:
+            from .auth import snapshot
+            cookies = snapshot()
+        for cookie in _session_jar(cookies):
+            ydl.cookiejar.set_cookie(cookie)
+
+
+def check_cookies(cookies_from_browser: Optional[str], session_cookies=None) -> dict[str, Any]:
     """Probe the user's Bilibili login state using the given browser's cookies.
 
     Strategy: ask yt-dlp's cookie extractor for a `CookieJar` (so we reuse the
@@ -104,7 +234,7 @@ def check_cookies(cookies_from_browser: Optional[str]) -> dict[str, Any]:
     if not cookies_from_browser:
         result["error"] = "未选择浏览器"
         return result
-    if cookies_from_browser not in {
+    if cookies_from_browser != "bilio" and cookies_from_browser not in {
         "chrome", "chromium", "brave", "edge", "firefox",
         "opera", "safari", "vivaldi", "whale",
     }:
@@ -112,29 +242,39 @@ def check_cookies(cookies_from_browser: Optional[str]) -> dict[str, Any]:
         return result
 
     # Extract cookies via yt-dlp so we share its keyring/profile handling.
+    access_error = None if cookies_from_browser == "bilio" else _cookie_access_error(cookies_from_browser)
+    if access_error:
+        result["error"] = access_error
+        return result
     try:
         from yt_dlp.cookies import extract_cookies_from_browser
 
-        jar = extract_cookies_from_browser(cookies_from_browser)
+        if cookies_from_browser == "bilio":
+            if session_cookies is None:
+                from .auth import snapshot
+                session_cookies = snapshot()
+            jar = _session_jar(session_cookies)
+        else:
+            jar = extract_cookies_from_browser(cookies_from_browser)
     except Exception as exc:
-        result["error"] = f"读取浏览器 Cookies 失败: {exc}"
+        result["error"] = ("请先在 Bilio 登录 B站" if cookies_from_browser == "bilio" else
+            "未找到浏览器登录数据，请先在所选浏览器登录 B站。" if "could not find" in str(exc) else
+            "无法读取浏览器登录数据，请检查系统权限或浏览器钥匙串授权后重试。")
         return result
 
-    bili_cookies = [c for c in jar if "bilibili.com" in (c.domain or "")]
+    bili_cookies = [c for c in jar if (c.domain or "").lstrip(".") == "bilibili.com" or (c.domain or "").endswith(".bilibili.com")]
     if not bili_cookies:
         result["error"] = "未在该浏览器中找到 bilibili.com 的 Cookies"
         return result
-    cookie_header = "; ".join(f"{c.name}={c.value}" for c in bili_cookies)
-
     req = urllib.request.Request(
         "https://api.bilibili.com/x/web-interface/nav",
         headers={
             **_DEFAULT_HTTP_HEADERS,
-            "Cookie": cookie_header,
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+        with opener.open(req, timeout=8) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.URLError as exc:
         result["error"] = f"调用 B站 API 失败: {exc}"
@@ -158,9 +298,13 @@ def check_cookies(cookies_from_browser: Optional[str]) -> dict[str, Any]:
     result["ok"] = True
     result["logged_in"] = bool(data.get("isLogin"))
     result["username"] = data.get("uname")
+    if cookies_from_browser == "bilio":
+        # This field is for the native process only; it is not a credential.
+        result["account_id"] = str(data.get("mid")) if data.get("mid") else None
     # `vipStatus`: 1 = active VIP, 0 = expired / never. `vipType`: 1 = 月度,
     # 2 = 年度 / 长期. The label object usually has `text` like "大会员".
-    result["is_vip"] = (data.get("vipStatus") == 1)
+    vip = data.get("vip") if isinstance(data.get("vip"), dict) else {}
+    result["is_vip"] = (data.get("vipStatus", vip.get("status")) == 1)
     label_obj = data.get("vip_label") or data.get("vip") or {}
     if isinstance(label_obj, dict):
         result["vip_label"] = label_obj.get("text") or label_obj.get("label")
@@ -173,6 +317,8 @@ def parse_url(
     url: str,
     cookies_from_browser: Optional[str] = None,
     on_entry: Optional[Callable[[int, int, dict[str, Any]], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+    session_cookies=None,
 ) -> dict[str, Any]:
     """Parse a Bilibili URL.
 
@@ -186,6 +332,9 @@ def parse_url(
     callback is responsible for any cross-thread serialization (the sidecar's
     `emit()` already takes the stdout lock).
     """
+    _check_cancel(cancel_event)
+    if urllib.parse.urlsplit(url).hostname == 'b23.tv':
+        url = resolve_short_link(url)
     opts: dict[str, Any] = {
         # Resolve playlist/collection containers but leave entries flat — we
         # only want titles/ids for the UI's "select episode" step.
@@ -195,25 +344,42 @@ def parse_url(
         "no_warnings": True,
         "noplaylist": False,
         "http_headers": _DEFAULT_HTTP_HEADERS,
+        "socket_timeout": 15,
+        "extractor_retries": 1,
+        "logger": QuietLogger(),
     }
     _apply_cookies(opts, cookies_from_browser)
     with YoutubeDL(opts) as ydl:
+        _apply_session(ydl, cookies_from_browser, session_cookies)
         info = ydl.extract_info(url, download=False)
+        if isinstance(info, dict) and 'bangumi' in str(info.get('extractor', '')).lower() and not info.get('series') and info.get('episode_id'):
+            try:
+                endpoint = 'https://api.bilibili.com/pgc/view/web/season?ep_id=' + str(int(info['episode_id']))
+                opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(ydl.cookiejar))
+                with opener.open(urllib.request.Request(endpoint, headers=_DEFAULT_HTTP_HEADERS), timeout=10) as response:
+                    metadata = json.loads(response.read(2 * 1024 * 1024))
+                if metadata.get('code') == 0:
+                    info['series'] = (metadata.get('result') or {}).get('title')
+            except Exception:
+                pass  # Missing optional series metadata must not block valid formats.
+    _check_cancel(cancel_event)
     shaped = _shape(info or {})
     if shaped.get("is_playlist") and shaped.get("entries"):
-        _enrich_entries(shaped["entries"], cookies_from_browser, on_entry=on_entry)
+        _enrich_entries(shaped["entries"], cookies_from_browser, on_entry=on_entry, cancel_event=cancel_event, session_cookies=session_cookies)
     return shaped
 
 
 def download_video(
     url: str,
-    format_id: str,
+    policy: dict,
     output_dir: str,
     progress_callback: Callable[[dict[str, Any]], None],
     cancel_event: threading.Event,
     cookies_from_browser: Optional[str] = None,
+    session_cookies=None,
+    display_title=None,
 ) -> Optional[str]:
-    """Download `url` at `format_id` into `output_dir`.
+    """Download `url` under a strict structured quality policy.
 
     Returns the final on-disk path of the merged output file (yt-dlp's
     `requested_downloads[0].filepath`), or None if not available.
@@ -223,26 +389,48 @@ def download_video(
     `CancelRequested` which bubbles up through yt-dlp.
     """
     os.makedirs(output_dir, exist_ok=True)
-    resolved_format = _format_with_audio(format_id)
+    if urllib.parse.urlsplit(url).hostname == 'b23.tv':
+        url = resolve_short_link(url)
+    _check_cancel(cancel_event)
+    resolved_format = quality_selector(policy)
+
+    tracker = None
+    final_path = None
 
     def _hook(d: dict[str, Any]) -> None:
         if cancel_event.is_set():
             raise CancelRequested()
-        progress_callback(d)
+        if tracker:
+            tracker.hook(d)
+
+    def _post_hook(d):
+        nonlocal final_path
+        _check_cancel(cancel_event)
+        if tracker:
+            tracker.publish("processing")
+        if d.get("status") == "finished":
+            candidate = (d.get("info_dict") or {}).get("filepath")
+            if candidate and os.path.isfile(candidate):
+                final_path = candidate
 
     opts: dict[str, Any] = {
-        # Bilibili exposes video and audio as separate DASH streams. A table
-        # row like "30080" is video-only, so exact ids must be expanded to
-        # "<id>+bestaudio/best"; richer expressions from batch downloads are
-        # already complete and should be left untouched.
+        # The selector keeps separate audio and has no unrestricted fallback.
         "format": resolved_format,
-        "outtmpl": os.path.join(output_dir, "%(title)s [%(id)s].%(ext)s"),
+        "outtmpl": os.path.join(output_dir, "%(title).160B [%(id)s] [%(format_id)s].%(ext)s"),
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,         # silence yt-dlp's own progress text
+        "continuedl": True,
+        "overwrites": False,
         "http_headers": _DEFAULT_HTTP_HEADERS,
         "progress_hooks": [_hook],
+        "postprocessor_hooks": [_post_hook],
+        "socket_timeout": 15,
+        "retries": 2,
+        "fragment_retries": 2,
+        "extractor_retries": 1,
         "noplaylist": True,         # single-video download; playlists are per-entry
+        "logger": QuietLogger(),
     }
 
     ffmpeg_path = _get_ffmpeg_path()
@@ -252,9 +440,21 @@ def download_video(
     _apply_cookies(opts, cookies_from_browser)
 
     with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+        _apply_session(ydl, cookies_from_browser, session_cookies)
+        info = ydl.extract_info(url, download=False)
+        _check_cancel(cancel_event)
+        if not isinstance(info, dict) or info.get("_type") == "playlist":
+            raise ValueError("请选择具体视频或分集后下载")
+        if display_title:
+            info['title'] = display_title
+        tracker = DownloadProgressTracker(info, progress_callback)
+        tracker.publish("starting")
+        info = ydl.process_ie_result(info, download=True)
+        _check_cancel(cancel_event)
         # yt-dlp puts the final merged path in `requested_downloads`.
         if isinstance(info, dict):
+            if final_path and os.path.isfile(final_path):
+                return final_path
             reqs = info.get("requested_downloads") or []
             if reqs and isinstance(reqs[0], dict):
                 return reqs[0].get("filepath")
@@ -275,7 +475,7 @@ def _format_with_audio(format_id: str) -> str:
         return fmt
     if any(op in fmt for op in ("+", "/", ",")):
         return fmt
-    return f"{fmt}+bestaudio/best"
+    return quality_selector({"mode": "exact", "format_id": fmt})
 
 
 def _entry_title(e: dict[str, Any], idx: int) -> Optional[str]:
@@ -337,6 +537,8 @@ def _enrich_entries(
     entries: list[dict[str, Any]],
     cookies_from_browser: Optional[str],
     on_entry: Optional[Callable[[int, int, dict[str, Any]], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+    session_cookies=None,
 ) -> None:
     """Resolve playlist entries once so the UI can show duration and quality.
 
@@ -355,12 +557,17 @@ def _enrich_entries(
         "no_warnings": True,
         "noplaylist": True,
         "http_headers": _DEFAULT_HTTP_HEADERS,
+        "socket_timeout": 15,
+        "extractor_retries": 1,
+        "logger": QuietLogger(),
     }
     _apply_cookies(opts, cookies_from_browser)
 
     total = len(entries)
     with YoutubeDL(opts) as ydl:
+        _apply_session(ydl, cookies_from_browser, session_cookies)
         for idx, entry in enumerate(entries):
+            _check_cancel(cancel_event)
             entry["detail_status"] = "pending"
             detail_url = entry.get("url")
             if not detail_url:
@@ -371,12 +578,14 @@ def _enrich_entries(
             try:
                 detail = ydl.extract_info(detail_url, download=False) or {}
             except Exception as exc:
+                _check_cancel(cancel_event)
                 entry["detail_status"] = "error"
-                entry["detail_error"] = str(exc)
+                entry["detail_error"] = user_error(exc)
                 if on_entry:
                     on_entry(idx, total, entry)
                 continue
 
+            _check_cancel(cancel_event)
             entry["detail_status"] = "ok"
             entry["title"] = _entry_display_title(detail, entry.get("title"))
             entry["duration"] = detail.get("duration") or entry.get("duration")
@@ -430,19 +639,17 @@ def _shape(info: dict[str, Any]) -> dict[str, Any]:
         # The raw `title` is just the episode number for bangumi (yt-dlp limitation);
         # render something a human can read.
         if episode_number is not None:
-            display_title = f"番剧 · 第 {episode_number} 集"
+            display_title = f"{info.get('series') or '番剧'} · 第 {episode_number} 集"
+            if info.get('episode') and info['episode'] != str(episode_number):
+                display_title += ' · ' + info['episode']
         else:
             display_title = f"番剧 · {raw_title}" if raw_title else "番剧"
     else:
         display_title = raw_title
 
-    # yt-dlp's bilibili-bangumi extractor reports an unreliable `duration` —
-    # the value is the entire-season cumulative time (or some other inflated
-    # number), not the single-episode duration. Showing it would mislead
-    # users into thinking they're getting an hour-long episode when they're
-    # actually getting ~24 min. Surface as None so the UI shows "—".
+    # The pinned extractor converts play_info.timelength from ms to seconds.
     raw_duration = info.get("duration")
-    safe_duration = None if kind == "bangumi" else raw_duration
+    safe_duration = raw_duration if isinstance(raw_duration, (int, float)) and math.isfinite(raw_duration) and raw_duration >= 0 else None
 
     return {
         "title": raw_title,

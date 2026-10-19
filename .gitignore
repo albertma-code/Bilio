@@ -1,5 +1,17 @@
 .venv/
+.venv-stable/
 downloads/
+
+# Local engineering notes and machine-specific acceptance reports
+docs/BUILD_*_LOCAL.json
+docs/SOAK_*_LOCAL.json
+docs/DEVELOPMENT_PLAN.md
+docs/V1_0_DEVELOPMENT_PLAN.md
+docs/IMPLEMENTATION_M0_M1.md
+docs/ITERATION_0.2.0.md
+docs/PRODUCT_0.3.0.md
+docs/STABILITY_0.2.1.md
+docs/archive/
 
 # Python
 __pycache__/
@@ -8,6 +20,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.playwright-mcp/
 
 # 敏感数据 —— 切勿提交
 *.cookies
@@ -16,6 +29,8 @@ cookies*.txt
 *cookie*.json
 *.session
 *.token
+*.sqlite3
+*.sqlite3-*
 .env
 .env.*
 

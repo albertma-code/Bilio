@@ -1,0 +1,26 @@
+name: macOS checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      - run: python -m venv .venv-stable
+      - run: .venv-stable/bin/python -m pip install -r requirements.txt
+      - run: npm run test:sidecar
+      - run: npm run tauri -- build --bundles app
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+      - run: .venv-stable/bin/python sidecar/tests/smoke_binary.py src-tauri/target/release/bundle/macos/Bilio.app/Contents/MacOS/bilio-sidecar

@@ -1,148 +1,142 @@
-"""Command dispatch table.
-
-A dispatcher is a generator that yields 0..N messages per request.
-Commands that run on a worker thread (`download`) spawn the thread and yield
-a single terminal result; the worker thread pushes progress via `emit()`.
-"""
+"""Nonblocking JSONL command dispatch; workers own slow operations."""
 from __future__ import annotations
 
-import os
 import threading
 import time
+import os
 from typing import Any, Iterator
 
-from .io import emit, log_stderr
+from .io import emit
+from .jobs import DownloadQueue
+from .storage import TaskStorage
+from .source import normalize_source
+from .worker import isolated_download
+from .errors import user_error
+from . import auth
 from .ytdlp import CancelRequested, check_cookies, download_video, parse_url
 
-# Active downloads keyed by request id.
-_active_jobs: dict[Any, threading.Event] = {}
+_storage_path = os.environ.get("BILIO_TASK_DB")
+_downloads = DownloadQueue(isolated_download, emit, storage=TaskStorage(_storage_path) if _storage_path else None)
+_metadata_slots = threading.BoundedSemaphore(2)
+_metadata_lock = threading.Lock()
+_metadata: dict[Any, threading.Event] = {}
+
+
+def _start_metadata(rid, cmd, args):
+    if not _metadata_slots.acquire(blocking=False):
+        raise ValueError("解析或账号检测正在进行，请稍后重试")
+    cancel = threading.Event()
+    with _metadata_lock:
+        if rid in _metadata:
+            _metadata_slots.release()
+            raise ValueError("任务 ID 已存在")
+        _metadata[rid] = cancel
+
+    def worker():
+        try:
+            if cmd == "parse":
+                def on_entry(index, total, entry):
+                    if cancel.is_set():
+                        raise CancelRequested()
+                    emit({"id": rid, "type": "parse_progress", "data": {
+                        "index": index, "total": total, "entry": entry}})
+                extra = {"session_cookies": auth.snapshot(args.get("auth_session_id"))} if args.get("cookies_from_browser") == "bilio" else {}
+                data = parse_url(args["url"], args.get("cookies_from_browser"), on_entry, cancel, **extra)
+            elif cmd == "check_session":
+                data = check_cookies("bilio", session_cookies=auth.validate_cookies(args.get("cookies")))
+            elif cmd=='check_update':
+                from .updates import check_latest
+                data=check_latest()
+            else:
+                data = check_cookies(args.get("cookies_from_browser"))
+            if cancel.is_set():
+                raise CancelRequested()
+            emit({"id": rid, "type": "result", "data": data})
+        except Exception as exc:
+            emit({"id": rid, "type": "error", "error": "已取消解析" if cancel.is_set() else user_error(exc)})
+        finally:
+            with _metadata_lock:
+                _metadata.pop(rid, None)
+            _metadata_slots.release()
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def dispatch(req: dict[str, Any]) -> Iterator[dict[str, Any]]:
-    cmd = req.get("cmd")
-    rid = req.get("id")
-    args = req.get("args") or {}
-
+    cmd, rid, args = req.get("cmd"), req.get("id"), req.get("args") or {}
     if cmd == "ping":
         yield {"id": rid, "type": "pong", "ts": time.time()}
         return
-
-    if cmd == "check_cookies":
-        cookies_from_browser = args.get("cookies_from_browser")
-        status = check_cookies(cookies_from_browser)
-        yield {"id": rid, "type": "result", "data": status}
+    if cmd in ("parse", "check_cookies", "check_session", "check_update"):
+        if cmd == "parse" and (not isinstance(args.get("url"), str) or not args["url"].strip()):
+            raise ValueError("缺少视频链接")
+        if cmd == "parse":
+            args["url"] = normalize_source(args["url"])
+        _start_metadata(rid, cmd, args)
         return
-
-    if cmd == "parse":
-        url = args.get("url")
-        cookies_from_browser = args.get("cookies_from_browser")
-        if not url or not isinstance(url, str):
-            yield {"id": rid, "type": "error", "error": "missing or invalid 'url'"}
-            return
-
-        # Acknowledge the request synchronously so the frontend can subscribe
-        # to `parse_progress` events before the sidecar starts the HTTP work
-        # that produces them. Without this, the listener might miss the first
-        # few entries on a fast-resolving small playlist.
-        emit({"id": rid, "type": "parse_started"})
-
-        # Per-entry callback: emit a `parse_progress` event so the UI can
-        # update the entry table incrementally. Uses the same id as the
-        # eventual `result`; the Rust shell forwards non-terminal types
-        # (anything that isn't `result`/`error`) to the frontend event bus
-        # without consuming the request's pending oneshot.
-        def _on_entry(index: int, total: int, entry: dict[str, Any]) -> None:
-            emit({
-                "id": rid,
-                "type": "parse_progress",
-                "data": {
-                    "index": index,
-                    "total": total,
-                    "entry": entry,
-                },
-            })
-
-        info = parse_url(
-            url,
-            cookies_from_browser=cookies_from_browser,
-            on_entry=_on_entry,
-        )
-        yield {"id": rid, "type": "result", "data": info}
+    if cmd == "set_session":
+        auth.install(args.get("session_id"), args.get("cookies"))
+        yield {"id": rid, "type": "result", "data": {"installed": True}}
         return
-
+    if cmd == "clear_session":
+        if auth.clear(args.get("session_id")):
+            for task in _downloads.snapshots():
+                if task["config"].get("cookies_from_browser") == "bilio":
+                    _downloads.cancel(task["jobId"])
+            with _metadata_lock:
+                for cancel in _metadata.values():
+                    cancel.set()
+        yield {"id": rid, "type": "result", "data": {"cleared": True}}
+        return
     if cmd == "download":
-        url = args.get("url")
-        format_id = args.get("format_id")
-        output_dir = os.path.expanduser(args.get("output_dir") or "~/Downloads/Bilio")
-        cookies_from_browser = args.get("cookies_from_browser")
-        if not url or not isinstance(url, str):
-            yield {"id": rid, "type": "error", "error": "missing or invalid 'url'"}
-            return
-        if not format_id or not isinstance(format_id, str):
-            yield {"id": rid, "type": "error", "error": "missing 'format_id'"}
-            return
-
-        cancel_ev = threading.Event()
-        _active_jobs[rid] = cancel_ev
-
-        # Yield a started acknowledgment immediately so Rust knows the job
-        # was accepted; actual progress is streamed via emit() from the thread.
-        yield {"id": rid, "type": "result", "data": {"status": "started"}}
-
-        def _worker():
-            try:
-                final_path = download_video(
-                    url=url,
-                    format_id=format_id,
-                    output_dir=output_dir,
-                    progress_callback=_make_progress_cb(rid),
-                    cancel_event=cancel_ev,
-                    cookies_from_browser=cookies_from_browser,
-                )
-                emit({
-                    "id": rid,
-                    "type": "result",
-                    "data": {"status": "completed", "filepath": final_path},
-                })
-            except CancelRequested:
-                emit({"id": rid, "type": "result", "data": {"status": "cancelled"}})
-            except Exception as e:
-                log_stderr(f"download error id={rid}: {e}")
-                emit({"id": rid, "type": "error", "error": str(e)})
-            finally:
-                _active_jobs.pop(rid, None)
-
-        threading.Thread(target=_worker, daemon=True).start()
-        return
-
-    if cmd == "cancel":
-        rid_to_cancel = args.get("job_id")
-        if rid_to_cancel and rid_to_cancel in _active_jobs:
-            _active_jobs[rid_to_cancel].set()
-            yield {"id": rid, "type": "result", "data": {"cancelled": rid_to_cancel}}
-        else:
-            yield {"id": rid, "type": "error", "error": f"no active job {rid_to_cancel!r}"}
-        return
-
-    yield {"id": rid, "type": "error", "error": f"unknown cmd: {cmd!r}"}
+        args["url"] = normalize_source(args.get("url"))
+        data = _downloads.submit(args["job_id"], args)
+    elif cmd == 'diagnostics':
+        import platform
+        from yt_dlp.version import __version__ as yt_version
+        from . import __version__
+        from collections import Counter
+        snapshots = _downloads.snapshots()
+        allowed_states={'queued','starting','downloading','processing','paused','pausing','cancelling','completed','cancelled','failed','interrupted'}
+        allowed_errors={'disk_full','permission','auth','format','network','file','unknown'}
+        data = {'engine_version':__version__,'python':platform.python_version(),'yt_dlp':yt_version,
+                'states':dict(Counter(t['status'] if t['status'] in allowed_states else 'unknown' for t in snapshots)),
+                'errors':dict(Counter(t.get('errorCode') if t.get('errorCode') in allowed_errors else 'unknown' for t in snapshots if t['status']=='failed')),
+                'unreadable_records':len(_downloads.storage.warnings) if _downloads.storage else 0}
+    elif cmd=='storage_status':
+        data={'unreadable_records':len(_downloads.storage.warnings) if _downloads.storage else 0}
+    elif cmd == "tasks":
+        data = _downloads.snapshots()
+    elif cmd == "pause":
+        data = _downloads.pause(args.get("job_id"))
+    elif cmd == "set_concurrency":
+        data = _downloads.set_concurrency(args.get("concurrency"))
+    elif cmd == "resume":
+        data = _downloads.resume(args.get("job_id"), args.get("auth_session_id"), args.get("account_ref"))
+    elif cmd in ('temp_info', 'clear_temp'):
+        data = _downloads.temporary(args.get('job_id'), cmd == 'clear_temp')
+    elif cmd=='relocate':
+        data=_downloads.relocate(args.get('job_id'),args.get('output_dir'))
+    elif cmd == "cancel_batch":
+        _downloads.cancel_batch(args.get("batch_id"))
+        data = {"requested": True}
+    elif cmd == "clear_finished":
+        data = {"removed": _downloads.clear_finished()}
+    elif cmd == "remove_finished":
+        data = {"removed": _downloads.remove_finished(args.get("job_id"))}
+    elif cmd == "cancel":
+        job_id = args.get("job_id")
+        with _metadata_lock:
+            cancel = _metadata.get(job_id)
+            if cancel:
+                cancel.set()
+        data = {"requested": bool(cancel) or _downloads.cancel(job_id)}
+    else:
+        raise ValueError(f"unknown cmd: {cmd!r}")
+    yield {"id": rid, "type": "result", "data": data}
 
 
-def _make_progress_cb(rid: Any):
-    """Return a callable suitable as a yt-dlp progress_hook."""
-
-    def cb(d: dict[str, Any]) -> None:
-        emit({
-            "id": rid,
-            "type": "progress",
-            "data": {
-                "status": d.get("status"),
-                "downloaded_bytes": d.get("downloaded_bytes"),
-                "total_bytes": d.get("total_bytes") or d.get("total_bytes_estimate"),
-                "speed": d.get("speed"),
-                "eta": d.get("eta"),
-                "filename": os.path.basename(d.get("filename", "") or ""),
-                "percent": d.get("_percent_str"),
-            },
-        })
-
-    return cb
+def shutdown():
+    _downloads.close()
+    with _metadata_lock:
+        for cancel in _metadata.values():
+            cancel.set()

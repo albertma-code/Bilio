@@ -1,24 +1,27 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Bilio",
-  "version": "0.1.1",
+  "version": "0.4.0",
   "identifier": "com.bilio.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run desktop:assets",
     "frontendDist": "../dist"
   },
   "app": {
     "windows": [
       {
         "title": "Bilio",
-        "width": 800,
-        "height": 600
+        "width": 1000,
+        "height": 720,
+        "minWidth": 640,
+        "minHeight": 480
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://*.hdslb.com https://*.bilibili.com; connect-src ipc: http://ipc.localhost; font-src 'self' data:; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'",
+      "devCsp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1420 http://127.0.0.1:1420 ws://127.0.0.1:1420; object-src 'none'; frame-src 'none'; base-uri 'none'"
     }
   },
   "bundle": {

@@ -32,6 +32,7 @@ export interface ParseProgressEvent {
 /** Result of `check_cookies` — what the Bilibili nav API says about the
  *  user's session, packaged with a probe-level `ok`/`error`. */
 export interface CookieStatus {
+  state?: string;
   ok: boolean;
   logged_in: boolean;
   username: string | null;
@@ -107,12 +108,9 @@ export interface ParsedVideo {
  * Parse a Bilibili URL.
  *
  * Streaming flow:
- *  1. We subscribe to `sidecar://message` FIRST and capture events whose id
- *     matches our pending request — done before `invoke` so no event can
- *     slip through between `start_parse` returning the id and the listener
- *     attaching.
- *  2. `invoke("start_parse")` returns a `job_id` immediately.
- *  3. The sidecar emits `parse_started` → `parse_progress` × N → terminal
+ *  1. We allocate a job id from Rust.
+ *  2. We subscribe to `sidecar://message` before any sidecar work starts.
+ *  3. The sidecar emits `parse_progress` × N → terminal
  *     `result`/`error`. We dispatch matching events to `onProgress` and
  *     resolve the promise on the terminal message.
  *
@@ -123,21 +121,35 @@ export async function parseUrl(
   url: string,
   cookiesFromBrowser?: string,
   onProgress?: (e: ParseProgressEvent) => void,
+  signal?: AbortSignal,
 ): Promise<ParsedVideo> {
-  // Capture events whose id matches our (not-yet-known) job before invoking,
-  // because the sidecar may start streaming before this async function gets
-  // back the id and could subscribe a second time.
-  let jobId: number | null = null;
+  const jobId = await invoke<number>("alloc_job_id");
+  if (signal?.aborted) throw new Error("已取消解析");
   let resolveResult: ((v: ParsedVideo) => void) | null = null;
   let rejectResult: ((e: Error) => void) | null = null;
   const resultPromise = new Promise<ParsedVideo>((res, rej) => {
     resolveResult = res;
     rejectResult = rej;
   });
+  // Attach before invoking so an immediate terminal event is never unhandled.
+  void resultPromise.catch(() => {});
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const resetTimeout = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      void cancelDownload(jobId).catch(() => {});
+      rejectResult?.(new Error("解析长时间无响应，已请求取消，请重试"));
+    }, 90000);
+  };
 
   const unlisten = await onSidecarMessage((msg) => {
-    if (jobId == null || msg.id !== jobId) return;
+    if (msg.type === "engine_exit") {
+      rejectResult?.(new Error("下载引擎已退出，请重启引擎后重试"));
+      return;
+    }
+    if (msg.id !== jobId) return;
     if (msg.type === "parse_progress") {
+      resetTimeout();
       const data = msg.data as ParseProgressEvent | undefined;
       if (data && onProgress) onProgress(data);
     } else if (msg.type === "result") {
@@ -147,13 +159,25 @@ export async function parseUrl(
     }
   });
 
+  const abort = () => {
+    void cancelDownload(jobId).catch(() => {});
+    rejectResult?.(new Error("已取消解析"));
+  };
+  signal?.addEventListener("abort", abort, { once: true });
+
   try {
-    jobId = await invoke<number>("start_parse", {
+    if (signal?.aborted) throw new Error("已取消解析");
+    resetTimeout();
+    await invoke("start_parse", {
+      jobId,
       url,
       cookiesFromBrowser: cookiesFromBrowser ?? null,
     });
+    if (signal?.aborted) abort();
     return await resultPromise;
   } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
     unlisten();
   }
 }
@@ -178,29 +202,16 @@ export function checkCookies(cookiesFromBrowser?: string): Promise<CookieStatus>
   });
 }
 
-/**
- * Start downloading a video. Returns a `job_id` immediately (sent every
- * progress and terminal event as `msg.id`). The download runs on the
- * sidecar's worker thread; progress events arrive on the `sidecar://message`
- * event bus.
- */
-export function downloadVideo(
-  url: string,
-  formatId: string,
-  outputDir: string,
-  cookiesFromBrowser?: string,
-): Promise<number> {
-  return invoke<number>("download_video", {
-    url,
-    formatId,
-    outputDir,
-    cookiesFromBrowser,
-  });
+/** Compiled and validated by the sidecar, never an arbitrary selector string. */
+export type QualityPolicy = { mode: "best" } | { mode: "max_height"; height: number } | { mode: "max_quality"; quality:number } | { mode: "exact"; format_id: string };
+
+export function taskCommand<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
+  return invoke<T>("task_command", { command, args });
 }
 
 /** Cancel a running download identified by its job_id. */
 export function cancelDownload(jobId: number): Promise<unknown> {
-  return invoke("cancel_download", { jobId });
+  return taskCommand("cancel", { job_id: jobId });
 }
 
 // ── Event subscriptions ────────────────────────────────────────────────
@@ -213,11 +224,13 @@ export function onSidecarMessage(
   cb: (msg: SidecarMessage) => void,
 ): Promise<UnlistenFn> {
   return listen<string>("sidecar://message", (event) => {
+    let message: SidecarMessage;
     try {
-      cb(JSON.parse(event.payload) as SidecarMessage);
+      message = JSON.parse(event.payload) as SidecarMessage;
     } catch {
-      // Non-JSON line is a protocol violation — ignore.
+      return;
     }
+    cb(message);
   });
 }
 

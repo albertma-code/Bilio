@@ -18,10 +18,9 @@ from __future__ import annotations
 
 import json
 import sys
-import traceback
 
 from . import __version__
-from .commands import dispatch
+from .errors import user_error
 from .io import emit, log_stderr
 
 
@@ -34,6 +33,11 @@ def main() -> None:
     except Exception:
         pass
 
+    try:
+        from .commands import dispatch, shutdown
+    except Exception:
+        emit({'id':None,'type':'engine_failure','error':'无法打开任务记录，可能被占用、损坏或升级备份冲突；请保留应用数据并检查目录后重启引擎。'})
+        return
     emit({"id": None, "type": "ready", "version": __version__})
 
     for raw in sys.stdin:
@@ -46,6 +50,9 @@ def main() -> None:
             emit({"id": None, "type": "error", "error": f"bad json: {e}"})
             continue
 
+        if not isinstance(req, dict) or not isinstance(req.get("args", {}), (dict, type(None))):
+            emit({"id": None, "type": "error", "error": "request must be an object with object args"})
+            continue
         rid = req.get("id")
         # Some commands (notably `download`) run on a worker thread and stream
         # progress events; their dispatcher returns immediately. Others run
@@ -56,5 +63,6 @@ def main() -> None:
             for msg in dispatch(req):
                 emit(msg)
         except Exception as e:  # never let a bad command kill the loop
-            log_stderr(f"unhandled exception for id={rid}: {e}\n{traceback.format_exc()}")
-            emit({"id": rid, "type": "error", "error": str(e)})
+            log_stderr(f"request failed: {type(e).__name__}")
+            emit({"id": rid, "type": "error", "error": user_error(e)})
+    shutdown()

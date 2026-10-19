@@ -1,0 +1,72 @@
+:root {
+  --accent: #167c69;
+  --progress: #318f7c;
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; scroll-behavior: auto !important; }
+}
+
+/* Graphite is the approved default; coral remains a development comparison. */
+:root[data-bilio-theme="coral"], :root[data-bilio-theme="graphite"] {
+  --page: #ffffff;
+  --sidebar: #f6f6f7;
+  --surface-subtle: #f1f2f4;
+  --border: #e0e3e7;
+  --text: #25272c;
+  --secondary: #555c66;
+  --muted: #626973;
+  --icon: #626973;
+  --success: #257347;
+  --warning: #865d13;
+  --danger: #a52d46;
+  --danger-bg: #fbeef2;
+  --warning-bg: #fff6e4;
+  --brand-detail: #bd443b;
+}
+:root[data-bilio-theme="coral"] {
+  --accent: #bd443b;
+  --progress: #bd443b;
+  --selected-bg: #fcefeb;
+  --selected-text: #a23831;
+}
+:root[data-bilio-theme="graphite"] {
+  --accent: #30343b;
+  --progress: #555c66;
+  --selected-bg: #e9ebef;
+  --selected-text: #30343b;
+}
+:root[data-bilio-theme]:not([data-bilio-theme="legacy"]) {
+  color: var(--text);
+  background: var(--page);
+}
+:root[data-bilio-theme]:not([data-bilio-theme="legacy"]) :is(button, a):focus-visible {
+  outline-color: var(--accent);
+}
+:root[data-bilio-theme]:not([data-bilio-theme="legacy"]) :is(.app-header, .sidebar, .library-footer, .list-toolbar, .task-row, .batch-heading, .video-summary, .submit-bar, .settings-section, .advanced-options) {
+  border-color: var(--border);
+}
+:root[data-bilio-theme]:not([data-bilio-theme="legacy"]) .sidebar { background: var(--sidebar); }
+:root[data-bilio-theme]:not([data-bilio-theme="legacy"]) .nav-item { color: var(--secondary); position: relative; }
+:root[data-bilio-theme]:not([data-bilio-theme="legacy"]) .nav-item:hover { background: var(--surface-subtle); }
+:root[data-bilio-theme]:not([data-bilio-theme="legacy"]) .nav-item.selected { color: var(--selected-text); background: var(--selected-bg); }
+:root[data-bilio-theme]:not([data-bilio-theme="legacy"]) .nav-item.selected::before {
+  content: ""; position: absolute; left: 0; top: 12px; bottom: 12px; width: 3px; border-radius: 2px; background: var(--brand-detail);
+}
+:root[data-bilio-theme]:not([data-bilio-theme="legacy"]) :is(.task-title, .video-meta h3, .detail-title) { color: var(--text); }
+:root[data-bilio-theme]:not([data-bilio-theme="legacy"]) :is(.task-meta, .task-status, .nav-caption, .nav-count, .sidebar-bottom, .library-count, .library-footer, .library-footer button, .list-toolbar, .download-stats, .batch-heading, .brand > span, .field-label, .content-kind, .video-meta p, .size-summary, .option-row > label, .submit-bar > span, .batch-note, .detail-list dt, .muted, .account-state, .about-line, .empty-state h3) { color: var(--muted); }
+:root[data-bilio-theme]:not([data-bilio-theme="legacy"]) :is(.task-symbol, .empty-symbol, .cover-placeholder) { color: var(--icon); background: var(--surface-subtle); }
+:root[data-bilio-theme]:not([data-bilio-theme="legacy"]) .row-actions .n-button { color: var(--icon); }
+:root[data-bilio-theme]:not([data-bilio-theme="legacy"]) :is(.task-title:hover, .source-link, .destination, .detail-status) { color: var(--accent); }
+:root[data-bilio-theme]:not([data-bilio-theme="legacy"]) :is(.downloading, .processing) .task-status { color: var(--secondary); }
+:root[data-bilio-theme]:not([data-bilio-theme="legacy"]) :is(.completed .task-status, .engine-ok) { color: var(--success); }
+:root[data-bilio-theme]:not([data-bilio-theme="legacy"]) .engine-dot.ready { background: var(--success); }
+:root[data-bilio-theme]:not([data-bilio-theme="legacy"]) :is(.failed, .interrupted) :is(.task-symbol, .task-status) { color: var(--danger); }
+:root[data-bilio-theme]:not([data-bilio-theme="legacy"]) :is(.failed, .interrupted) .task-symbol { background: var(--danger-bg); }
+:root[data-bilio-theme]:not([data-bilio-theme="legacy"]) :is(.task-error, .error-text) { color: var(--danger); }
+:root[data-bilio-theme]:not([data-bilio-theme="legacy"]) .account-warning { color: var(--warning); background: var(--warning-bg); }
+:root[data-bilio-theme]:not([data-bilio-theme="legacy"]) .account-warning button { color: var(--warning); }
+:root[data-bilio-theme]:not([data-bilio-theme="legacy"]) .advanced-options .n-collapse-item__header-main { color: var(--secondary); }
+:root[data-bilio-theme]:not([data-bilio-theme="legacy"]) .parse-loading { color: var(--accent); }
+@media (max-width: 760px) {
+  :root[data-bilio-theme]:not([data-bilio-theme="legacy"]) .sidebar { background: var(--sidebar); }
+}

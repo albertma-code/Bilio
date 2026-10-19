@@ -1,2 +1,7 @@
 yt-dlp==2025.10.14
 imageio-ffmpeg==0.6.0
+pyinstaller==6.21.0
+pyinstaller-hooks-contrib==2026.8
+altgraph==0.17.5
+macholib==1.16.4
+packaging==26.3

@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <!-- B站粉渐变：顶部稍浅、底部饱和，给 squircle 一点立体感 -->
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FC8BAA"/>
+      <stop offset="1" stop-color="#FB7299"/>
+    </linearGradient>
+    <!-- 顶部高光，macOS 图标惯用的光泽 -->
+    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.22"/>
+      <stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- macOS squircle 背景（圆角矩形近似） -->
+  <rect x="0" y="0" width="1024" height="1024" rx="225" ry="225" fill="url(#bg)"/>
+  <rect x="0" y="0" width="1024" height="1024" rx="225" ry="225" fill="url(#gloss)"/>
+
+  <!-- 白色主图形：b 字母 = 下载箭头
+       竖线杆既是 b 的主干，也是箭头杆；右侧圆肚是 b 的肚子；
+       底部三角是下载箭头头。三者共用同一根竖线，概念合一。 -->
+  <g fill="#FFFFFF">
+    <!-- 竖线杆（b 的主干 / 箭头杆），顶部圆角 -->
+    <rect x="412" y="220" width="120" height="500" rx="60" ry="60"/>
+    <!-- b 的圆肚 -->
+    <circle cx="560" cy="500" r="130"/>
+    <!-- 下载箭头头，顶接杆底 -->
+    <polygon points="332,680 612,680 472,840"/>
+  </g>
+</svg>

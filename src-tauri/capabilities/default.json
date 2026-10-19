@@ -7,13 +7,6 @@
     "core:default",
     "opener:default",
     "opener:allow-open-path",
-    "opener:allow-reveal-item-in-dir",
-    {
-      "identifier": "shell:allow-spawn",
-      "allow": [
-        { "name": "binaries/bilio-sidecar", "sidecar": true }
-      ]
-    },
-    "shell:allow-stdin-write"
+    "opener:allow-reveal-item-in-dir"
   ]
 }
